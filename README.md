@@ -9,6 +9,7 @@
 - **电话拨号**：支持 TTS 语音播报
 - **批量配置**：WiFi、SIM 卡号、消息转发等
 - **多种推送**：支持 Bark、SMTP、企业微信、钉钉、飞书、Server酱、PushPlus、WxPusher 等
+- **双栈支持**：同时支持 IPv4 和 IPv6 访问
 
 ## 安装方式
 
@@ -29,7 +30,9 @@ sudo bash install.sh install
 - 服务端口（默认 8000）
 - UI 登录密码（至少 6 位）
 
-安装完成后访问：`http://服务器IP:8000/`
+安装完成后访问：
+- IPv4: `http://192.168.x.x:8000/`
+- IPv6: `http://[您的IPv6地址]:8000/`
 
 #### 脚本命令说明
 
@@ -47,7 +50,7 @@ sudo bash install.sh restart
 sudo bash install.sh logs
 ```
 
-#### 安装参数
+#### 安装参数（可选）
 
 ```bash
 sudo bash install.sh install \
@@ -65,6 +68,8 @@ sudo bash install.sh install \
 | `--ui-pass` | UI 登录密码 |
 
 ### 方式二：Docker 安装
+
+#### 快速启动
 
 ```bash
 # 拉取镜像
@@ -93,6 +98,8 @@ docker run -d --net=host \
 
 #### Docker Compose 示例
 
+创建 `docker-compose.yml` 文件：
+
 ```yaml
 services:
   lvyou-smsweb:
@@ -106,6 +113,12 @@ services:
       - SERVER_PORT=9000
     volumes:
       - ./data:/opt/board-manager/data
+```
+
+启动命令：
+
+```bash
+docker compose up -d
 ```
 
 #### 环境变量说明
@@ -122,9 +135,19 @@ services:
 
 ## 卸载
 
+### 脚本安装卸载
+
 ```bash
 cd lvyou_smsweb
 sudo bash uninstall.sh
+```
+
+### Docker 安装卸载
+
+```bash
+docker rm -f lvyou-smsweb
+docker rmi lovexme/lvyou-smsweb:latest
+rm -rf ./data
 ```
 
 ## 常见问题
@@ -153,6 +176,12 @@ sudo systemctl status board-manager-v6 --no-pager
 ```bash
 cat /etc/board-manager.conf
 ```
+
+### Docker 容器无法启动
+
+1. 确保使用了 `--net=host` 网络模式
+2. 检查端口是否被占用：`ss -tlnp | grep 8000`
+3. 查看容器日志：`docker logs lvyou-smsweb`
 
 ## 技术栈
 
