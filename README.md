@@ -77,6 +77,7 @@ docker pull lovexme/lvyou-smsweb:latest
 
 # 运行容器（必须使用 host 网络模式）
 docker run -d --net=host \
+  --restart unless-stopped \
   -e BMUIPASS=登录密码 \
   -v ./data:/opt/board-manager/data \
   --name lvyou-smsweb \
@@ -89,8 +90,9 @@ docker run -d --net=host \
 
 ```bash
 docker run -d --net=host \
+  --restart unless-stopped \
   -e BMUIPASS=登录密码 \
-  -e SERVER_PORT=9000 \
+  -e SERVER_PORT=8000 \
   -v ./data:/opt/board-manager/data \
   --name lvyou-smsweb \
   lovexme/lvyou-smsweb:latest
