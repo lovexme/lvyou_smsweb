@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import threading
 import json
 import os
@@ -7,6 +8,7 @@ import secrets
 import sqlite3
 import subprocess
 import time
+from datetime import datetime
 from ipaddress import ip_address, ip_network, IPv4Network
 from typing import Any, Dict, List, Optional, Tuple
 from itertools import islice
@@ -25,6 +27,9 @@ from sqlalchemy.orm import sessionmaker, Session
 import requests
 import concurrent.futures
 import hmac
+import logging
+
+logger = logging.getLogger(__name__)
 
 DBPATH = os.environ.get("BMDB", "/opt/board-manager/data/data.db")
 STATICDIR = os.environ.get("BMSTATIC", "/opt/board-manager/static")
@@ -32,7 +37,9 @@ DEFAULTUSER = os.environ.get("BMDEVUSER", "admin")
 DEFAULTPASS = os.environ.get("BMDEVPASS", "admin")
 
 TIMEOUT = float(os.environ.get("BMHTTPTIMEOUT", "5.0"))
-CONCURRENCY = int(os.environ.get("BMSCANCONCURRENCY", "32"))
+CONCURRENCY = int(os.environ.get("BMSCANCONCURRENCY", "64"))
+TCP_CONCURRENCY = int(os.environ.get("BMTCPCONCURRENCY", "128"))
+TCP_TIMEOUT = float(os.environ.get("BMTCPTIMEOUT", "0.3"))
 CIDRFALLBACKLIMIT = int(os.environ.get("BMCIDRFALLBACKLIMIT", "1024"))
 SCAN_RETRIES = int(os.environ.get("BMSCANRETRIES", "3"))
 SCAN_RETRY_SLEEP_MS = int(os.environ.get("BMSCANRETRYSLEEPMS", "300"))
@@ -226,7 +233,7 @@ def guessipv4cidr() -> str:
         pass
 
     try:
-        txt = sh(["bash", "-lc", "ip -o -4 addr show | awk '{print \(2, \)4}'"])
+        txt = sh(["bash", "-lc", "ip -o -4 addr show | awk '{print $2, $4}'"])
         for line in txt.splitlines():
             parts = line.strip().split()
             if len(parts) != 2:
@@ -273,29 +280,37 @@ def getarptable() -> Dict[str, str]:
 
 
 def prewarm_neighbors(net: IPv4Network) -> None:
-    processes = []
     try:
-        hosts = [str(host) for host in islice(net.hosts(), min(CIDRFALLBACKLIMIT, 256))]
-        for chunk_start in range(0, len(hosts), 64):
-            chunk = hosts[chunk_start: chunk_start + 64]
-            for ip in chunk:
-                proc = subprocess.Popen(
-                    ["ping", "-c", "1", "-W", "1", ip],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                processes.append(proc)
-
+        hosts = [str(host) for host in islice(net.hosts(), CIDRFALLBACKLIMIT)]
+        processes = []
+        for ip in hosts:
+            proc = subprocess.Popen(
+                ["ping", "-c", "1", "-W", "1", ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(proc)
+        deadline = time.time() + 8
         for proc in processes:
+            remaining = max(0, deadline - time.time())
             try:
-                proc.wait(timeout=2)
-            except Exception:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
                 try:
                     proc.kill()
                 except Exception:
                     pass
     except Exception:
         pass
+    time.sleep(0.5)
+
+
+def _tcp_port_open(ip: str, port: int = 80) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=TCP_TIMEOUT):
+            return True
+    except Exception:
+        return False
 
 
 def _bm_op_from_sta(sta: str) -> str:
@@ -327,19 +342,20 @@ def istargetdevice(ip: str, user: str, pw: str) -> Tuple[bool, Optional[str]]:
             if resp2.status_code == 200:
                 return True, realm
             raise RuntimeError(f"auth status {resp2.status_code}")
-        except Exception:
+        except Exception as _scan_exc:
             if attempt < max(1, SCAN_RETRIES) - 1:
+                logger.debug(f"scan {ip} attempt {attempt + 1} failed: {_scan_exc}")
                 time.sleep(max(0, SCAN_RETRY_SLEEP_MS) / 1000.0)
     return False, last_realm
 
 
 def getdevicedata(ip: str, user: str, pw: str) -> Optional[Dict[str, Any]]:
-    url = f"http://{ip}/mgr?a=getHtmlData_index"
     keys = ["DEV_ID", "DEV_VER", "SIM1_PHNUM", "SIM2_PHNUM", "SIM1_OP", "SIM2_OP", "SIM1_STA", "SIM2_STA"]
     payload = {"keys": keys}
     try:
         resp = requests.post(
-            url,
+            f"http://{ip}/mgr",
+            params={"a": "getHtmlData_index"},
             timeout=TIMEOUT,
             auth=requests.auth.HTTPDigestAuth(user, pw),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -413,6 +429,7 @@ def upsertdevice(
                 db.flush()
             except Exception:
                 db.rollback()
+                return _device_to_dict(device)
 
     if device:
         device.devId = devid if devid else device.devId
@@ -442,7 +459,7 @@ def upsertdevice(
             sim1operator=sim1op,
             sim2number=sim2num,
             sim2operator=sim2op,
-            created=subprocess.check_output(["date", "+%Y-%m-%d %H:%M:%S"], text=True).strip(),
+            created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         db.add(device)
 
@@ -706,6 +723,17 @@ def scanstart(
         if len(iplist) >= CIDRFALLBACKLIMIT:
             break
 
+    open80: List[str] = []
+    open80_lock = threading.Lock()
+
+    def tcp_probe(ip: str):
+        if _tcp_port_open(ip, 80):
+            with open80_lock:
+                open80.append(ip)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=TCP_CONCURRENCY) as executor:
+        list(executor.map(tcp_probe, iplist))
+
     found: List[Dict[str, Any]] = []
     found_lock = threading.Lock()
 
@@ -722,12 +750,14 @@ def scanstart(
                 thread_db.close()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        list(executor.map(probe, iplist))
+        list(executor.map(probe, open80))
 
     return {
         "ok": True,
         "cidr": cidr,
         "found": len(found),
+        "scanned": len(open80),
+        "total_ips": len(iplist),
         "devices": [{"ip": item["ip"], "devId": item.get("devId", "")} for item in found],
     }
 
@@ -942,7 +972,7 @@ def enhanced_forward_task_sync(device: Device, req: EnhancedBatchForwardReq) -> 
 
 
 @app.post("/api/devices/batch/enhanced-forward")
-async def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depends(get_db)):
+def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
@@ -972,10 +1002,10 @@ def _get_timeout_default() -> int:
 
 
 def fetch_device_token(ip: str, user: str, pw: str) -> str:
-    url = f"http://{ip}/mgr?a=getHtmlData_passwdMgr"
     body = 'keys=%7B%22keys%22%3A%5B%22TOKEN%22%5D%7D'
     resp = requests.post(
-        url,
+        f"http://{ip}/mgr",
+        params={"a": "getHtmlData_passwdMgr"},
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=_get_timeout_default() + 5,

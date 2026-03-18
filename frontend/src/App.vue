@@ -288,8 +288,8 @@ async function startScanAdd() {
       id: device.id,
       ip: device.ip,
       mac: device.mac,
-      name: device.name,
-      group_name: device.group_name
+      devId: device.devId,
+      grp: device.grp
     }))
   )
 
@@ -324,8 +324,8 @@ async function startScanAdd() {
           id: device.id,
           ip: device.ip,
           mac: device.mac,
-          name: device.name,
-          group_name: device.group_name
+          devId: device.devId,
+          grp: device.grp
         }))
       )
 

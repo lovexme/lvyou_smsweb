@@ -103,4 +103,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${SERVER_PORT}/api/health || exit 1
 
 # 启动命令（支持自定义端口，同时监听 IPv4 和 IPv6）
-CMD ["sh", "-c", "python -m uvicorn backend.main:app --host 0.0.0.0 --host :: --port ${SERVER_PORT}"]
+CMD ["sh", "-c", "python -m uvicorn backend.main:app --host 0.0.0.0 --port ${SERVER_PORT} & python -m uvicorn backend.main:app --host :: --port ${SERVER_PORT} & wait"]
