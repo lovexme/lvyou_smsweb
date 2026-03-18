@@ -1,12 +1,19 @@
 ---
 name: model-switch
-description: Switch the current session model, inspect the current override, reset back to the default model, or spawn a new session on a specified model. Use when the user asks to switch models, check the active model, compare models, or run a task on another model.
-allowed-tools: session_status, sessions_spawn
+description: Switch the current session model, inspect the current override, reset back to the default model, or spawn a new session on a specified model. Supports local alias/config guidance via models.json. Use when the user asks to switch models, check the active model, compare models, or run a task on another model.
+allowed-tools: read, session_status, sessions_spawn
 ---
 
 # Model Switch
 
 Use this skill whenever the user wants to change which model is used.
+
+## Local files
+
+- Config file: `models.json`
+- Optional notes: `README.md`
+
+Before applying alias normalization, read `models.json` if it exists.
 
 ## What this skill covers
 
@@ -14,11 +21,34 @@ Use this skill whenever the user wants to change which model is used.
 - Switch the **current chat** to another model
 - Reset the current chat back to the default model
 - Start a **new separate session** on another model
-- Help the user compare "switch here" vs "spawn a new session"
+- Use a local alias map instead of hardcoding shorthand in the skill text
 
 ## Core rule
 
-Treat model ids as exact strings unless you have a safe local alias mapping. Do not invent ids.
+Treat model ids as exact strings unless a safe alias mapping exists in `models.json`. Do not invent ids.
+
+## Config behavior
+
+If `models.json` exists, use it as the source of truth for:
+- alias normalization
+- default keyword mapping
+- local notes about uncertain model names
+
+Expected structure:
+
+```json
+{
+  "version": 1,
+  "defaultModel": "default",
+  "aliases": {
+    "默认": "default",
+    "4o": "gpt-4o"
+  },
+  "notes": {
+    "claude sonnet": "Keep as-is unless the exact configured id is known."
+  }
+}
+```
 
 ## Decision guide
 
@@ -34,23 +64,13 @@ Treat model ids as exact strings unless you have a safe local alias mapping. Do 
 - the user wants to compare outputs across models
 - the user asks for a long or isolated task on another model
 
-## Safe alias handling
+## Alias handling
 
-You may normalize a few obvious shorthand aliases **only if the user intent is clear**.
-If there is any doubt, keep the exact text or ask for the exact model id.
-
-Suggested safe aliases:
-
-- `默认` / `default` → `default`
-- `4o` → `gpt-4o`
-- `4.1` → `gpt-4.1`
-- `o3` → `o3`
-- `o4-mini` → `o4-mini`
-- `gemini flash` → `gemini-2.0-flash`
-- `gemini pro` → keep as-is unless the exact configured id is known
-- `claude sonnet` → keep as-is unless the exact configured id is known
-
-If the runtime rejects the model id, tell the user plainly and ask for the exact id they want.
+1. Read `models.json` when available.
+2. Look up the user's requested shorthand in `aliases`.
+3. If there is a clear alias match, use the mapped exact model id.
+4. If there is no alias match, keep the user-provided model string unchanged.
+5. If `notes` says a label is uncertain, do not silently invent a model id.
 
 ## Workflow
 
@@ -62,23 +82,23 @@ Summarize:
 - whether the session is using default behavior
 
 ### 2) Switch current chat
-Call:
-- `session_status` with `model: "<exact-model-id>"`
+- normalize via `models.json` if safe
+- call `session_status` with `model: "<resolved-model-id>"`
 
 Then confirm:
 - this chat is now using the requested model, or
 - the switch failed and the user needs a valid model id
 
 ### 3) Reset current chat to default
-Call:
-- `session_status` with `model: "default"`
+- prefer the configured `defaultModel` mapping if present
+- in practice, reset with `session_status` using `model: "default"`
 
 Then confirm the session is back on the default model behavior.
 
 ### 4) Spawn a new session on another model
 Call `sessions_spawn` with:
 - a concise task
-- `model: "<exact-model-id>"`
+- `model: "<resolved-model-id>"`
 - runtime chosen to match the task
 - on Discord ACP requests, prefer thread-bound persistent sessions if applicable
 
@@ -102,35 +122,33 @@ Action:
 2. summarize the active model and override state
 
 ### Pattern: switch current chat
-User: 切到 gpt-4o
+User: 切到 4o
 Action:
-1. normalize if safe
-2. call `session_status` with `model: "gpt-4o"`
-3. confirm current chat is switched
+1. read `models.json`
+2. resolve `4o -> gpt-4o`
+3. call `session_status` with `model: "gpt-4o"`
+4. confirm current chat is switched
 
 ### Pattern: reset current chat
 User: 切回默认
 Action:
-1. call `session_status` with `model: "default"`
-2. confirm reset
+1. read `models.json`
+2. resolve default keyword if useful
+3. call `session_status` with `model: "default"`
+4. confirm reset
 
 ### Pattern: spawn another model for a task
-User: 用 gemini 跑这个任务，但别切当前聊天
+User: 用 gemini flash 跑这个任务，但别切当前聊天
 Action:
-1. call `sessions_spawn` with the user task and requested model
-2. confirm a separate session was created
-
-### Pattern: compare models
-User: 分别用 gpt-4o 和 o3 看一下这个问题
-Action:
-1. keep current chat unchanged unless asked otherwise
-2. spawn one or more separate sessions with requested models
-3. return / relay the results clearly labeled by model
+1. read `models.json`
+2. resolve alias if available
+3. call `sessions_spawn` with the user task and resolved model
+4. confirm a separate session was created
 
 ## Failure handling
 
 If a model switch or spawn fails:
 - do not fake success
 - report the exact failure briefly
-- suggest checking the precise model id
+- suggest checking the precise model id or updating `models.json`
 - if useful, offer to try again with another exact id

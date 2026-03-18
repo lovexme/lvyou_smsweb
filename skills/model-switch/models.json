@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "defaultModel": "default",
+  "aliases": {
+    "默认": "default",
+    "default": "default",
+    "4o": "gpt-4o",
+    "gpt4o": "gpt-4o",
+    "4.1": "gpt-4.1",
+    "gpt4.1": "gpt-4.1",
+    "o3": "o3",
+    "o4-mini": "o4-mini",
+    "gemini flash": "gemini-2.0-flash"
+  },
+  "notes": {
+    "gemini pro": "Keep as-is unless your environment has a known exact configured id.",
+    "claude sonnet": "Keep as-is unless your environment has a known exact configured id."
+  }
+}
