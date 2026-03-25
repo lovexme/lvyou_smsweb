@@ -102,21 +102,24 @@ docker run -d --net=host \
 
 #### Docker Compose 示例
 
-创建 `docker-compose.yml` 文件：
+项目已包含完整的 `docker-compose.yml` 配置文件，可直接使用：
+
+```bash
+# 复制示例配置（如果需要自定义）
+cp docker-compose.yml docker-compose.prod.yml
+
+# 编辑环境变量
+vi docker-compose.prod.yml
+
+# 启动服务
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+或直接使用项目提供的配置：
 
 ```yaml
-services:
-  lvyou-smsweb:
-    image: lovexme/lvyou-smsweb:latest
-    container_name: lvyou-smsweb
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      - BMUIUSER=admin
-      - BMUIPASS=your_password
-      - SERVER_PORT=9000
-    volumes:
-      - ./data:/opt/board-manager/data
+# 详见 docker-compose.yml 文件
+# 包含完整的 v3.4.0 环境变量配置
 ```
 
 启动命令：
@@ -144,6 +147,30 @@ docker compose up -d
 | `BMLOGINRATELIMIT` | 5 | 登录尝试频率限制（次/分钟） |
 | `BMSMSMAXLEN` | 500 | 短信内容最大长度 |
 | `BMALLOWORIGINS` | 空 | CORS 允许的域名，逗号分隔 |
+
+#### 本地构建镜像
+
+项目提供构建脚本，支持多平台构建：
+
+```bash
+# 查看构建帮助
+./build-docker.sh --help
+
+# 本地构建
+./build-docker.sh
+
+# 构建指定版本
+./build-docker.sh -t v3.4.0
+
+# 多平台构建并推送到 Docker Hub（需要登录）
+./build-docker.sh -p --platform linux/amd64,linux/arm64
+```
+
+构建脚本功能：
+- 支持多平台构建 (amd64, arm64)
+- 自动标签管理
+- 健康检查集成
+- Docker Hub 推送支持
 
 ## 卸载
 
