@@ -26,24 +26,38 @@
 #       environment:
 #         - BMUIPASS=your_password
 #         - SERVER_PORT=9000
+#         - BMSCANCONCURRENCY=64
+#         - BMSMSRATELIMIT=10
+#         - BMDIALRATELIMIT=5
+#         - BMLOGINRATELIMIT=5
 #       volumes:
 #         - ./data:/opt/board-manager/data
 #
 # 环境变量说明：
-#   SERVER_PORT     - 服务端口 (默认: 8000)
-#   BMUIUSER        - UI 登录用户名 (默认: admin)
-#   BMUIPASS        - UI 登录密码 (默认: admin)
-#   BMDEVUSER       - 设备扫描用户名 (默认: admin)
-#   BMDEVPASS       - 设备扫描密码 (默认: admin)
-#   BMHTTPTIMEOUT   - HTTP 超时秒数 (默认: 5.0)
-#   BMSCANCONCURRENCY - 扫描并发数 (默认: 32)
+#   SERVER_PORT        - 服务端口 (默认: 8000)
+#   BMUIUSER           - UI 登录用户名 (默认: admin)
+#   BMUIPASS           - UI 登录密码 (默认: admin)
+#   BMDEVUSER          - 设备扫描用户名 (默认: admin)
+#   BMDEVPASS          - 设备扫描密码 (默认: admin)
+#   BMHTTPTIMEOUT      - HTTP 超时秒数 (默认: 5.0)
+#   BMSCANCONCURRENCY  - 扫描并发数 (默认: 64)
+#   BMTCPCONCURRENCY   - TCP 端口探测并发数 (默认: 128)
+#   BMSCANRETRIES      - 扫描重试次数 (默认: 3)
+#   BMSCANTTL          - 扫描结果存活时间（秒）(默认: 3600)
+#   BMSMSRATELIMIT     - 短信发送频率限制（次/分钟）(默认: 10)
+#   BMDIALRATELIMIT    - 电话拨号频率限制（次/分钟）(默认: 5)
+#   BMLOGINRATELIMIT   - 登录尝试频率限制（次/分钟）(默认: 5)
+#   BMSMSMAXLEN        - 短信内容最大长度 (默认: 500)
+#   BMALLOWORIGINS     - CORS 允许的域名，逗号分隔 (默认: 空)
 # ========================================
 
 FROM python:3.11-slim
 
+ARG VERSION="3.4.0"
+
 LABEL maintainer="lovexme"
 LABEL description="绿邮X系列内网群控系统"
-LABEL version="3.3.0"
+LABEL version="${VERSION}"
 
 # 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,7 +92,7 @@ RUN npm run build
 WORKDIR /app
 
 # 复制后端代码
-COPY backend/main.py /app/backend/
+COPY backend/ /app/backend/
 
 # 创建数据目录和静态文件目录
 RUN mkdir -p /opt/board-manager/data /opt/board-manager/static \
@@ -92,7 +106,15 @@ ENV BMDEVPASS=admin
 ENV BMUIUSER=admin
 ENV BMUIPASS=admin
 ENV BMHTTPTIMEOUT=5.0
-ENV BMSCANCONCURRENCY=32
+ENV BMSCANCONCURRENCY=64
+ENV BMTCPCONCURRENCY=128
+ENV BMSCANRETRIES=3
+ENV BMSCANTTL=3600
+ENV BMSMSRATELIMIT=10
+ENV BMDIALRATELIMIT=5
+ENV BMLOGINRATELIMIT=5
+ENV BMSMSMAXLEN=500
+ENV BMALLOWORIGINS=""
 ENV SERVER_PORT=8000
 
 # 暴露端口
