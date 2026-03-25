@@ -30,49 +30,11 @@ const ttsText = ref('')
 const selectedIds = ref([])
 const selectAll = ref(false)
 
-const showEnhancedForwardModal = ref(false)
 const showWifiModal = ref(false)
-const showSimModal = ref(false)
 const showDetailModal = ref(false)
-
-const forwardMethod = ref('0')
-const enhancedForwardConfig = ref({
-  deviceKey0: '',
-  deviceKey1: '',
-  deviceKey2: '',
-  smtpProvider: '1',
-  smtpServer: '',
-  smtpPort: '',
-  smtpAccount: '',
-  smtpPassword: '',
-  smtpFromEmail: '',
-  smtpToEmail: '',
-  smtpEncryption: 'starttls',
-  webhookUrl1: '',
-  webhookUrl2: '',
-  webhookUrl3: '',
-  signKey1: '',
-  signKey2: '',
-  signKey3: '',
-  sc3ApiUrl: '',
-  sctSendKey: '',
-  PPToken: '',
-  PPChannel: '',
-  PPWebhook: '',
-  PPFriends: '',
-  PPGroupId: '',
-  WPappToken: '',
-  WPUID: '',
-  WPTopicId: '',
-  lyApiUrl: '',
-  forwardUrl: '',
-  notifyUrl: ''
-})
 
 const wifiSsid = ref('')
 const wifiPwd = ref('')
-const sim1Number = ref('')
-const sim2Number = ref('')
 const deviceDetail = ref(null)
 
 const scanCidr = ref('')
@@ -121,22 +83,17 @@ function restoreAuth() {
   return true
 }
 
+// FIX: 登录页新增 HTTP 429 频率限制错误提示
 async function login() {
   const password = uiPass.value.trim()
   if (!password) {
     setNotice('请输入密码', 'err')
     return
   }
-
   loading.value = true
   clearNotice()
-
   try {
-    const response = await api.post('/api/login', {
-      username: 'admin',
-      password
-    })
-
+    const response = await api.post('/api/login', { username: 'admin', password })
     const data = response.data || {}
     saveAuth(data.token, data.expiresIn || 28800)
     authed.value = true
@@ -146,10 +103,14 @@ async function login() {
   } catch (e) {
     authed.value = false
     clearStoredAuth()
-    if (e && e.response && e.response.status === 401) {
+    const status = e && e.response && e.response.status
+    const detail = e && e.response && e.response.data && e.response.data.detail
+    if (status === 429) {
+      setNotice(detail || '登录尝试过于频繁，请稍后再试', 'err')
+    } else if (status === 401) {
       setNotice('密码错误，请重试', 'err')
     } else {
-      setNotice((e && e.response && e.response.data && e.response.data.detail) || '连接失败，请检查服务是否运行', 'err')
+      setNotice(detail || '连接失败，请检查服务是否运行', 'err')
     }
   } finally {
     loading.value = false
@@ -187,7 +148,6 @@ api.interceptors.response.use(
 
 onMounted(async () => {
   if (!restoreAuth()) return
-
   loading.value = true
   try {
     await api.get('/api/health')
@@ -225,7 +185,6 @@ const filteredDevices = computed(() => {
       (device.sims && device.sims.sim2 && device.sims.sim2.number || '').includes(keyword) ||
       (device.sims && device.sims.sim1 && device.sims.sim1.operator || '').toLowerCase().includes(keyword) ||
       (device.sims && device.sims.sim2 && device.sims.sim2.operator || '').toLowerCase().includes(keyword)
-
     const matchGroup = groupFilter.value === 'all' || device.grp === groupFilter.value
     return matchSearch && matchGroup
   })
@@ -248,12 +207,7 @@ function displayName(device) {
 function prettyTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts * 1000)
-  return d.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
-  })
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 async function refresh() {
@@ -263,11 +217,13 @@ async function refresh() {
       api.get('/api/devices'),
       api.get('/api/numbers')
     ])
-    devices.value = result[0].data || []
-    numbers.value = result[1].data || []
+    const devData = result[0].data
+    devices.value = Array.isArray(devData) ? devData : (devData.items || [])
+    const numData = result[1].data
+    numbers.value = Array.isArray(numData) ? numData : (numData.items || [])
   } catch (e) {
     if (!(e && e.response && e.response.status === 401)) {
-      setNotice('获取数据失败', 'err')
+      setNotice('获取数据失败，请检查网络连接', 'err')
     }
   } finally {
     loading.value = false
@@ -278,95 +234,67 @@ function toggleSelectAll() {
   selectedIds.value = selectAll.value ? filteredDevices.value.map(device => device.id) : []
 }
 
-// ========== 替换后的 startScanAdd ==========
+// FIX: 凭据改为 POST Body；用 completed 标志防止超时误判
 async function startScanAdd() {
   scanning.value = true
-  setNotice('正在扫描网络...', 'info')
-
-  const oldFingerprint = JSON.stringify(
-    (devices.value || []).map(device => ({
-      id: device.id,
-      ip: device.ip,
-      mac: device.mac,
-      devId: device.devId,
-      grp: device.grp
-    }))
-  )
-
+  setNotice('正在提交扫描任务...', 'info')
   try {
-    const scanResp = await api.post('/api/scan/start', null, {
-      params: {
-        cidr: scanCidr.value || undefined,
-        group: scanGroup.value || undefined,
-        user: scanUser.value,
-        password: scanPass.value
-      }
+    const scanResp = await api.post('/api/scan/start', {
+      cidr:     scanCidr.value  || undefined,
+      group:    scanGroup.value || undefined,
+      user:     scanUser.value,
+      password: scanPass.value
     })
-
-    let latestDevices = []
-    let latestNumbers = []
-    let changed = false
-
-    for (let i = 0; i < 30; i++) {
-      const listResp = await Promise.all([
-        api.get('/api/devices'),
-        api.get('/api/numbers')
-      ])
-
-      latestDevices = listResp[0].data || []
-      latestNumbers = listResp[1].data || []
-
-      devices.value = latestDevices
-      numbers.value = latestNumbers
-
-      const newFingerprint = JSON.stringify(
-        latestDevices.map(device => ({
-          id: device.id,
-          ip: device.ip,
-          mac: device.mac,
-          devId: device.devId,
-          grp: device.grp
-        }))
-      )
-
-      if (newFingerprint !== oldFingerprint) {
-        changed = true
-        break
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 2000))
+    const scanId = scanResp.data && scanResp.data.scanId
+    if (!scanId) {
+      setNotice('扫描任务创建失败', 'err')
+      scanning.value = false
+      return
     }
-
-    const found = (scanResp.data && scanResp.data.found) || 0
-
-    if (changed) {
-      setNotice(`扫描完成，设备列表已自动更新`, found ? 'ok' : 'warn')
-    } else {
-      setNotice(`扫描任务已提交，设备可能稍后出现，可点一次刷新确认`, 'warn')
+    setNotice('扫描进行中，请稍候...', 'info')
+    let completed = false
+    for (let i = 0; i < 60; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      try {
+        const statusResp = await api.get('/api/scan/status/' + scanId)
+        const st = statusResp.data || {}
+        const progress = st.progress || ''
+        if (st.status === 'done') {
+          completed = true
+          setNotice(`扫描完成，发现 ${st.found} 台设备`, st.found ? 'ok' : 'warn')
+          await refresh()
+          break
+        } else if (st.status === 'error') {
+          completed = true
+          setNotice(progress || '扫描出错', 'err')
+          break
+        } else if (progress) {
+          setNotice(`扫描中: ${progress}`, 'info')
+        }
+      } catch {
+        // 状态查询失败，继续重试
+      }
+    }
+    // FIX: 只在确实未完成时才提示超时
+    if (!completed) {
+      setNotice('扫描超时，设备可能稍后出现，可点一次刷新确认', 'warn')
+      await refresh()
     }
   } catch (e) {
-    if (!(e && e.response && e.response.status === 401)) {
-      setNotice((e && e.response && e.response.data && e.response.data.detail) || '扫描失败', 'err')
-    }
+    const detail = e && e.response && e.response.data && e.response.data.detail
+    setNotice(detail || '扫描启动失败，请检查网络连接', 'err')
   } finally {
     scanning.value = false
   }
 }
-// ==========================================
 
 function parseSenderValue() {
   const raw = String(fromSelected.value || '')
   const parts = raw.split('|')
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
-    return null
-  }
-
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null
   const deviceId = Number(parts[0])
   const slot = Number(parts[1])
-  if (!Number.isInteger(deviceId) || !Number.isInteger(slot)) {
-    return null
-  }
-
+  if (!Number.isInteger(deviceId) || !Number.isInteger(slot)) return null
   return { deviceId, slot }
 }
 
@@ -375,13 +303,11 @@ async function send() {
     setNotice('请填写完整', 'err')
     return
   }
-
   const sender = parseSenderValue()
   if (!sender) {
     setNotice('请选择有效的发送卡号', 'err')
     return
   }
-
   loading.value = true
   try {
     await api.post('/api/sms/send-direct', {
@@ -394,7 +320,15 @@ async function send() {
     toPhone.value = ''
     content.value = ''
   } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || '发送失败', 'err')
+    const status = e && e.response && e.response.status
+    const detail = e && e.response && e.response.data && e.response.data.detail
+    if (status === 429) {
+      setNotice(detail || '发送过于频繁，请稍后再试', 'err')
+    } else if (status === 400) {
+      setNotice(detail || '参数错误，请检查手机号和内容', 'err')
+    } else {
+      setNotice(detail || '发送失败，请检查网络和设备状态', 'err')
+    }
   } finally {
     loading.value = false
   }
@@ -405,13 +339,11 @@ async function dial() {
     setNotice('请填写完整', 'err')
     return
   }
-
   const sender = parseSenderValue()
   if (!sender) {
     setNotice('请选择有效的发送卡号', 'err')
     return
   }
-
   loading.value = true
   try {
     await api.post('/api/tel/dial', {
@@ -424,7 +356,13 @@ async function dial() {
     dialPhone.value = ''
     ttsText.value = ''
   } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || '拨号失败', 'err')
+    const status = e && e.response && e.response.status
+    const detail = e && e.response && e.response.data && e.response.data.detail
+    if (status === 429) {
+      setNotice(detail || '拨号过于频繁，请稍后再试', 'err')
+    } else {
+      setNotice(detail || '拨号失败，请检查网络和设备状态', 'err')
+    }
   } finally {
     loading.value = false
   }
@@ -456,7 +394,6 @@ async function setGroup(device) {
 
 async function deleteDevice(device) {
   if (!confirm('确认删除设备 ' + displayName(device) + '？')) return
-
   loading.value = true
   try {
     await api.delete('/api/devices/' + device.id)
@@ -482,44 +419,6 @@ function isSelected(id) {
   return selectedIds.value.includes(id)
 }
 
-function openEnhancedForwardModal() {
-  if (!selectedCount.value) {
-    setNotice('请先勾选设备', 'err')
-    return
-  }
-  showEnhancedForwardModal.value = true
-}
-
-function closeEnhancedForwardModal() {
-  showEnhancedForwardModal.value = false
-  forwardMethod.value = '0'
-  Object.keys(enhancedForwardConfig.value).forEach(key => {
-    enhancedForwardConfig.value[key] = ''
-  })
-  enhancedForwardConfig.value.smtpProvider = '1'
-  enhancedForwardConfig.value.smtpEncryption = 'starttls'
-}
-
-async function applyEnhancedForward() {
-  loading.value = true
-  try {
-    const payload = {
-      device_ids: selectedIds.value,
-      forward_method: forwardMethod.value,
-      ...enhancedForwardConfig.value
-    }
-    const response = await api.post('/api/devices/batch/enhanced-forward', payload)
-    const list = response.data && response.data.results ? response.data.results : []
-    const okCount = list.filter(item => item.ok).length
-    setNotice('转发配置完成：' + okCount + '/' + list.length, okCount ? 'ok' : 'err')
-    closeEnhancedForwardModal()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '配置失败', 'err')
-  } finally {
-    loading.value = false
-  }
-}
-
 function openWifiModal() {
   if (!selectedCount.value) {
     setNotice('请先勾选设备', 'err')
@@ -534,46 +433,11 @@ function closeWifiModal() {
   wifiPwd.value = ''
 }
 
-function openSimModal() {
-  if (!selectedCount.value) {
-    setNotice('请先勾选设备', 'err')
-    return
-  }
-  showSimModal.value = true
-}
-
-function closeSimModal() {
-  showSimModal.value = false
-  sim1Number.value = ''
-  sim2Number.value = ''
-}
-
-async function applySim() {
-  loading.value = true
-  try {
-    const response = await api.post('/api/devices/batch/sim', {
-      device_ids: selectedIds.value,
-      sim1: sim1Number.value.trim(),
-      sim2: sim2Number.value.trim()
-    })
-    const list = response.data && response.data.results ? response.data.results : []
-    const okCount = list.filter(item => item.ok).length
-    setNotice('SIM配置完成：' + okCount + '/' + list.length, okCount ? 'ok' : 'err')
-    closeSimModal()
-    await refresh()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '配置失败', 'err')
-  } finally {
-    loading.value = false
-  }
-}
-
 async function applyWifi() {
   if (!wifiSsid.value.trim()) {
     setNotice('请输入SSID', 'err')
     return
   }
-
   loading.value = true
   try {
     const response = await api.post('/api/devices/batch/wifi', {
@@ -598,12 +462,9 @@ async function batchDeleteSelected() {
     return
   }
   if (!confirm('确认删除所选 ' + selectedCount.value + ' 台设备？')) return
-
   loading.value = true
   try {
-    const response = await api.post('/api/devices/batch/delete', {
-      device_ids: selectedIds.value
-    })
+    const response = await api.post('/api/devices/batch/delete', { device_ids: selectedIds.value })
     const deleted = response.data && response.data.deleted ? response.data.deleted : 0
     setNotice('删除完成：' + deleted + '/' + selectedCount.value, deleted ? 'ok' : 'warn')
     selectedIds.value = []
@@ -637,7 +498,6 @@ function closeDetailModal() {
 async function saveSimSingle() {
   const id = deviceDetail.value && deviceDetail.value.device && deviceDetail.value.device.id
   if (!id) return
-
   loading.value = true
   try {
     await api.post('/api/devices/' + id + '/sim', {
@@ -786,9 +646,7 @@ async function saveSimSingle() {
           </select>
         </div>
         <div class="toolbar-right">
-          <button class="toolbar-btn" @click="openSimModal" :disabled="selectedCount === 0">💳 SIM</button>
           <button class="toolbar-btn" @click="openWifiModal" :disabled="selectedCount === 0">📶 WiFi</button>
-          <button class="toolbar-btn" @click="openEnhancedForwardModal" :disabled="selectedCount === 0">⚙️ 转发</button>
           <button class="toolbar-btn danger" @click="batchDeleteSelected" :disabled="selectedCount === 0">🗑️ 删除</button>
         </div>
       </div>
@@ -875,11 +733,7 @@ async function saveSimSingle() {
         <table v-else>
           <thead>
             <tr>
-              <th>号码</th>
-              <th>运营商</th>
-              <th>设备</th>
-              <th>IP</th>
-              <th>槽位</th>
+              <th>号码</th><th>运营商</th><th>设备</th><th>IP</th><th>槽位</th>
             </tr>
           </thead>
           <tbody>
@@ -911,126 +765,6 @@ async function saveSimSingle() {
         </div>
       </div>
 
-      <div v-if="showSimModal" class="modal-overlay" @click.self="closeSimModal">
-        <div class="modal">
-          <div class="modal-header">
-            <h3>💳 批量配置 SIM 卡号</h3>
-            <button class="modal-close" @click="closeSimModal">×</button>
-          </div>
-          <div class="modal-body">
-            <input v-model="sim1Number" class="form-input" placeholder="SIM1 号码（留空不修改）" />
-            <input v-model="sim2Number" class="form-input" placeholder="SIM2 号码（留空不修改）" />
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="closeSimModal">取消</button>
-            <button class="btn-confirm" @click="applySim" :disabled="loading">确认配置</button>
-          </div>
-        </div>
-      </div>
-
-      <div v-if="showEnhancedForwardModal" class="modal-overlay" @click.self="closeEnhancedForwardModal">
-        <div class="modal modal-lg">
-          <div class="modal-header">
-            <h3>⚙️ 批量转发配置</h3>
-            <button class="modal-close" @click="closeEnhancedForwardModal">×</button>
-          </div>
-          <div class="modal-body">
-            <div class="form-group">
-              <label class="form-label">转发方式</label>
-              <select v-model="forwardMethod" class="form-select-full">
-                <option value="0">禁用转发</option>
-                <option value="1">Bark (单Key)</option>
-                <option value="2">Bark (多Key)</option>
-                <option value="8">SMTP 邮件</option>
-                <option value="10">企业微信</option>
-                <option value="11">飞书</option>
-                <option value="13">钉钉</option>
-                <option value="21">Server酱 Turbo</option>
-                <option value="22">Server酱 3</option>
-                <option value="30">PushPlus</option>
-                <option value="35">WxPusher</option>
-                <option value="90">绿微平台</option>
-                <option value="99">自定义 URL</option>
-              </select>
-            </div>
-
-            <div v-if="['1','2'].includes(forwardMethod)" class="config-section">
-              <input v-model="enhancedForwardConfig.deviceKey0" class="form-input" placeholder="Bark Key 0" />
-              <template v-if="forwardMethod === '2'">
-                <input v-model="enhancedForwardConfig.deviceKey1" class="form-input" placeholder="Bark Key 1" />
-                <input v-model="enhancedForwardConfig.deviceKey2" class="form-input" placeholder="Bark Key 2" />
-              </template>
-            </div>
-
-            <div v-if="forwardMethod === '8'" class="config-section">
-              <select v-model="enhancedForwardConfig.smtpProvider" class="form-select-full">
-                <option value="1">QQ 邮箱</option>
-                <option value="2">163 邮箱</option>
-                <option value="3">Gmail</option>
-                <option value="0">自定义</option>
-              </select>
-              <input v-model="enhancedForwardConfig.smtpServer" class="form-input" placeholder="SMTP 服务器" />
-              <input v-model="enhancedForwardConfig.smtpPort" class="form-input" placeholder="端口" />
-              <input v-model="enhancedForwardConfig.smtpAccount" class="form-input" placeholder="账号" />
-              <input v-model="enhancedForwardConfig.smtpPassword" class="form-input" type="password" placeholder="密码/授权码" autocomplete="off" />
-              <input v-model="enhancedForwardConfig.smtpFromEmail" class="form-input" placeholder="发件邮箱" />
-              <input v-model="enhancedForwardConfig.smtpToEmail" class="form-input" placeholder="收件邮箱" />
-              <select v-model="enhancedForwardConfig.smtpEncryption" class="form-select-full">
-                <option value="starttls">STARTTLS</option>
-                <option value="ssl">SSL/TLS</option>
-                <option value="none">无加密</option>
-              </select>
-            </div>
-
-            <div v-if="['10','11','13'].includes(forwardMethod)" class="config-section">
-              <input v-model="enhancedForwardConfig.webhookUrl1" class="form-input" placeholder="Webhook URL 1" />
-              <input v-model="enhancedForwardConfig.webhookUrl2" class="form-input" placeholder="Webhook URL 2（可选）" />
-              <input v-model="enhancedForwardConfig.webhookUrl3" class="form-input" placeholder="Webhook URL 3（可选）" />
-              <template v-if="forwardMethod === '13'">
-                <input v-model="enhancedForwardConfig.signKey1" class="form-input" placeholder="签名 Key 1" />
-                <input v-model="enhancedForwardConfig.signKey2" class="form-input" placeholder="签名 Key 2（可选）" />
-                <input v-model="enhancedForwardConfig.signKey3" class="form-input" placeholder="签名 Key 3（可选）" />
-              </template>
-            </div>
-
-            <div v-if="forwardMethod === '21'" class="config-section">
-              <input v-model="enhancedForwardConfig.sctSendKey" class="form-input" placeholder="SendKey" />
-            </div>
-
-            <div v-if="forwardMethod === '22'" class="config-section">
-              <input v-model="enhancedForwardConfig.sc3ApiUrl" class="form-input" placeholder="API URL" />
-            </div>
-
-            <div v-if="forwardMethod === '30'" class="config-section">
-              <input v-model="enhancedForwardConfig.PPToken" class="form-input" placeholder="Token" />
-              <input v-model="enhancedForwardConfig.PPChannel" class="form-input" placeholder="Channel（可选）" />
-              <input v-model="enhancedForwardConfig.PPWebhook" class="form-input" placeholder="Webhook（可选）" />
-              <input v-model="enhancedForwardConfig.PPFriends" class="form-input" placeholder="好友 OpenID（可选）" />
-              <input v-model="enhancedForwardConfig.PPGroupId" class="form-input" placeholder="群组 ID（可选）" />
-            </div>
-
-            <div v-if="forwardMethod === '35'" class="config-section">
-              <input v-model="enhancedForwardConfig.WPappToken" class="form-input" placeholder="AppToken" />
-              <input v-model="enhancedForwardConfig.WPUID" class="form-input" placeholder="UID" />
-              <input v-model="enhancedForwardConfig.WPTopicId" class="form-input" placeholder="TopicId（可选）" />
-            </div>
-
-            <div v-if="forwardMethod === '90'" class="config-section">
-              <input v-model="enhancedForwardConfig.lyApiUrl" class="form-input" placeholder="API URL" />
-            </div>
-
-            <div v-if="forwardMethod === '99'" class="config-section">
-              <input v-model="enhancedForwardConfig.forwardUrl" class="form-input" placeholder="转发 URL" />
-              <input v-model="enhancedForwardConfig.notifyUrl" class="form-input" placeholder="通知 URL（可选）" />
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="closeEnhancedForwardModal">取消</button>
-            <button class="btn-confirm" @click="applyEnhancedForward" :disabled="loading">确认配置</button>
-          </div>
-        </div>
-      </div>
-
       <div v-if="showDetailModal && deviceDetail" class="modal-overlay" @click.self="closeDetailModal">
         <div class="modal">
           <div class="modal-header">
@@ -1055,7 +789,6 @@ async function saveSimSingle() {
               <div class="detail-item"><span class="detail-label">SIM2 号码</span><span class="mono">{{ deviceDetail.device && deviceDetail.device.sim2number || '-' }}</span></div>
               <div class="detail-item"><span class="detail-label">SIM2 运营商</span><span>{{ deviceDetail.device && deviceDetail.device.sim2operator || '-' }}</span></div>
             </div>
-
             <div class="sim-edit-section">
               <p class="sim-edit-title">编辑 SIM 卡号</p>
               <input v-model="deviceDetail.device.sim1number" class="form-input" placeholder="SIM1 号码" />
@@ -1096,45 +829,15 @@ body {
   min-height: 100vh;
 }
 
-.login-container {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 20px;
-}
-.login-box {
-  background: var(--bg-card);
-  border-radius: 16px;
-  padding: 40px;
-  width: 100%;
-  max-width: 380px;
-  text-align: center;
-}
+.login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+.login-box { background: var(--bg-card); border-radius: 16px; padding: 40px; width: 100%; max-width: 380px; text-align: center; }
 .login-icon { font-size: 48px; margin-bottom: 16px; }
 .login-title { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
 .login-subtitle { color: var(--text-secondary); font-size: 13px; margin-bottom: 24px; }
 .login-form { display: flex; flex-direction: column; gap: 12px; }
-.login-input {
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px 16px;
-  font-size: 16px;
-  color: var(--text-primary);
-  outline: none;
-}
+.login-input { background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; font-size: 16px; color: var(--text-primary); outline: none; }
 .login-input:focus { border-color: var(--primary); }
-.login-button {
-  background: var(--primary);
-  color: white;
-  border: none;
-  border-radius: 8px;
-  padding: 14px;
-  font-size: 16px;
-  font-weight: 500;
-  cursor: pointer;
-}
+.login-button { background: var(--primary); color: white; border: none; border-radius: 8px; padding: 14px; font-size: 16px; font-weight: 500; cursor: pointer; }
 .login-button:hover:not(:disabled) { background: var(--primary-dark); }
 .login-button:disabled { opacity: 0.6; cursor: not-allowed; }
 .login-notice { margin-top: 14px; padding: 10px 14px; border-radius: 8px; font-size: 14px; }
@@ -1144,73 +847,27 @@ body {
 .notice-info { background: rgba(59,130,246,0.15); color: var(--primary); }
 .notice-warn { background: rgba(245,158,11,0.15); color: var(--warning); }
 
-.main-container {
-  padding: 20px;
-  max-width: 1400px;
-  margin: 0 auto;
-}
+.main-container { padding: 20px; max-width: 1400px; margin: 0 auto; }
 
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
-  flex-wrap: wrap;
-  gap: 16px;
-}
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 16px; }
 .header-left { display: flex; align-items: center; gap: 12px; }
 .logo { font-size: 32px; }
 .header-title h1 { font-size: 20px; font-weight: 600; }
 .header-title p { font-size: 12px; color: var(--text-secondary); }
 .header-right { display: flex; gap: 8px; flex-wrap: wrap; }
-.header-btn {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  padding: 8px 16px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 14px;
-}
+.header-btn { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-primary); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; }
 .header-btn:hover:not(:disabled) { background: var(--bg-card-hover); }
 .header-btn.primary { background: var(--primary); border-color: var(--primary); color: white; }
 .header-btn.primary:hover:not(:disabled) { background: var(--primary-dark); }
 .header-btn.logout { color: var(--danger); }
 .header-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.notice-bar {
-  padding: 12px 16px;
-  border-radius: 8px;
-  margin-bottom: 16px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.notice-close {
-  background: none;
-  border: none;
-  color: inherit;
-  font-size: 20px;
-  cursor: pointer;
-}
+.notice-bar { padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+.notice-close { background: none; border: none; color: inherit; font-size: 20px; cursor: pointer; }
 
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(4,1fr);
-  gap: 16px;
-  margin-bottom: 20px;
-}
-@media (max-width: 768px) {
-  .stats-grid { grid-template-columns: repeat(2,1fr); }
-}
-.stat-card {
-  background: var(--bg-card);
-  border-radius: 12px;
-  padding: 20px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
+.stats-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 16px; margin-bottom: 20px; }
+@media (max-width: 768px) { .stats-grid { grid-template-columns: repeat(2,1fr); } }
+.stat-card { background: var(--bg-card); border-radius: 12px; padding: 20px; display: flex; align-items: center; gap: 16px; }
 .stat-icon { font-size: 32px; }
 .stat-value { font-size: 28px; font-weight: 700; }
 .stat-label { font-size: 13px; color: var(--text-secondary); }
@@ -1219,406 +876,112 @@ body {
 .stat-card.total .stat-value { color: var(--primary); }
 .stat-card.sim .stat-value { color: var(--warning); }
 
-.sms-section {
-  background: var(--bg-card);
-  border-radius: 12px;
-  padding: 20px;
-  margin-bottom: 20px;
-}
-.section-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
-}
+.sms-section { background: var(--bg-card); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .section-header h2 { font-size: 16px; font-weight: 600; }
 .mode-tabs { display: flex; gap: 4px; }
-.mode-tab {
-  background: var(--bg-dark);
-  border: none;
-  color: var(--text-secondary);
-  padding: 7px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-}
+.mode-tab { background: var(--bg-dark); border: none; color: var(--text-secondary); padding: 7px 16px; border-radius: 6px; cursor: pointer; }
 .mode-tab.active { background: var(--primary); color: white; }
 
-.form-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .form-grid .form-select,
-.form-grid .form-input {
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  color: var(--text-primary);
-  font-size: 14px;
-  outline: none;
-}
-.form-grid .form-textarea {
-  grid-column: span 2;
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  color: var(--text-primary);
-  font-size: 14px;
-  resize: vertical;
-  outline: none;
-}
-.form-grid .btn-send {
-  grid-column: span 2;
-  background: var(--primary);
-  border: none;
-  color: white;
-  padding: 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-weight: 500;
-}
+.form-grid .form-input { background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-size: 14px; outline: none; }
+.form-grid .form-textarea { grid-column: span 2; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-size: 14px; resize: vertical; outline: none; }
+.form-grid .btn-send { grid-column: span 2; background: var(--primary); border: none; color: white; padding: 12px; border-radius: 8px; cursor: pointer; font-weight: 500; }
 .form-grid .btn-send:hover:not(:disabled) { background: var(--primary-dark); }
 .form-grid .btn-send:disabled { opacity: 0.5; cursor: not-allowed; }
+@media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } .form-grid .form-textarea, .form-grid .btn-send { grid-column: span 1; } }
 
-@media (max-width: 640px) {
-  .form-grid { grid-template-columns: 1fr; }
-  .form-grid .form-textarea,
-  .form-grid .btn-send { grid-column: span 1; }
-}
-
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
-}
+.toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 .toolbar-left { display: flex; gap: 10px; flex: 1; flex-wrap: wrap; }
 .toolbar-right { display: flex; gap: 8px; flex-wrap: wrap; }
-.search-input {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 14px;
-  color: var(--text-primary);
-  flex: 1;
-  min-width: 180px;
-  max-width: 300px;
-  outline: none;
-}
-.filter-select {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 14px;
-  color: var(--text-primary);
-  outline: none;
-}
-.toolbar-btn {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  padding: 9px 14px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-}
+.search-input { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text-primary); flex: 1; min-width: 180px; max-width: 300px; outline: none; }
+.filter-select { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text-primary); outline: none; }
+.toolbar-btn { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-primary); padding: 9px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
 .toolbar-btn:hover:not(:disabled) { background: var(--bg-card-hover); }
 .toolbar-btn.danger { color: var(--danger); }
 .toolbar-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.batch-bar {
-  background: var(--primary);
-  color: white;
-  padding: 10px 16px;
-  border-radius: 8px;
-  margin-bottom: 12px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.batch-cancel {
-  background: rgba(255,255,255,0.2);
-  border: none;
-  color: white;
-  padding: 5px 12px;
-  border-radius: 6px;
-  cursor: pointer;
-}
+.batch-bar { background: var(--primary); color: white; padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+.batch-cancel { background: rgba(255,255,255,0.2); border: none; color: white; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
 
-.tab-bar {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 16px;
-  border-bottom: 1px solid var(--border);
-}
-.tab-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  padding: 10px 16px;
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-}
+.tab-bar { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+.tab-btn { background: none; border: none; color: var(--text-secondary); padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
 .tab-btn:hover { color: var(--text-primary); }
 .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
 
-.cards-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 16px;
-}
-.device-card {
-  background: var(--bg-card);
-  border-radius: 12px;
-  overflow: hidden;
-  border: 2px solid transparent;
-}
+.cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.device-card { background: var(--bg-card); border-radius: 12px; overflow: hidden; border: 2px solid transparent; }
 .device-card:hover { background: var(--bg-card-hover); }
 .device-card.selected { border-color: var(--primary); }
 .device-card.offline { opacity: 0.75; }
 
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-}
+.card-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); }
 .card-checkbox { cursor: pointer; }
-.checkbox {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border: 2px solid var(--border);
-  border-radius: 4px;
-  font-size: 12px;
-  color: transparent;
-}
+.checkbox { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 2px solid var(--border); border-radius: 4px; font-size: 12px; color: transparent; }
 .checkbox.checked { background: var(--primary); border-color: var(--primary); color: white; }
-
-.card-status {
-  font-size: 12px;
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-weight: 500;
-}
+.card-status { font-size: 12px; padding: 3px 8px; border-radius: 4px; font-weight: 500; }
 .card-status.online { background: rgba(16,185,129,0.2); color: var(--success); }
 .card-status.offline { background: rgba(239,68,68,0.2); color: var(--danger); }
 
 .card-body { padding: 14px; }
-.device-name {
-  font-size: 15px;
-  font-weight: 600;
-  margin-bottom: 3px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.device-name { font-size: 15px; font-weight: 600; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .device-ip { font-family: monospace; font-size: 13px; color: var(--primary); margin-bottom: 3px; }
 .device-mac { font-family: monospace; font-size: 11px; color: var(--text-secondary); margin-bottom: 10px; }
 
-.sims-info {
-  background: var(--bg-dark);
-  border-radius: 8px;
-  padding: 10px;
-  margin-bottom: 10px;
-}
+.sims-info { background: var(--bg-dark); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
 .sim-item { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
 .sim-item:last-child { margin-bottom: 0; }
-.sim-label {
-  font-size: 10px;
-  background: var(--primary);
-  color: white;
-  padding: 2px 5px;
-  border-radius: 3px;
-  flex-shrink: 0;
-}
+.sim-label { font-size: 10px; background: var(--primary); color: white; padding: 2px 5px; border-radius: 3px; flex-shrink: 0; }
 .sim-op { font-size: 11px; color: var(--text-secondary); }
 .sim-num { font-family: monospace; font-size: 12px; margin-left: auto; }
-
-.device-meta {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
+.device-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary); }
 
 .card-actions { display: flex; border-top: 1px solid var(--border); }
-.card-btn {
-  flex: 1;
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  padding: 10px;
-  cursor: pointer;
-  font-size: 15px;
-}
+.card-btn { flex: 1; background: none; border: none; color: var(--text-secondary); padding: 10px; cursor: pointer; font-size: 15px; }
 .card-btn:hover { background: var(--bg-card-hover); color: var(--text-primary); }
 .card-btn.danger:hover { color: var(--danger); }
 
-.empty-state {
-  text-align: center;
-  padding: 60px 20px;
-  color: var(--text-secondary);
-}
+.empty-state { text-align: center; padding: 60px 20px; color: var(--text-secondary); }
 .empty-icon { font-size: 56px; margin-bottom: 12px; opacity: 0.5; }
 .empty-state p { margin-bottom: 16px; }
-.empty-btn {
-  background: var(--primary);
-  color: white;
-  border: none;
-  padding: 10px 24px;
-  border-radius: 8px;
-  cursor: pointer;
-}
+.empty-btn { background: var(--primary); color: white; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; }
 
-.numbers-table {
-  background: var(--bg-card);
-  border-radius: 12px;
-  overflow: hidden;
-}
+.numbers-table { background: var(--bg-card); border-radius: 12px; overflow: hidden; }
 .numbers-table table { width: 100%; border-collapse: collapse; }
-.numbers-table th,
-.numbers-table td {
-  padding: 12px 16px;
-  text-align: left;
-  border-bottom: 1px solid var(--border);
-}
-.numbers-table th {
-  background: var(--bg-dark);
-  font-size: 13px;
-  color: var(--text-secondary);
-  font-weight: 500;
-}
+.numbers-table th, .numbers-table td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+.numbers-table th { background: var(--bg-dark); font-size: 13px; color: var(--text-secondary); font-weight: 500; }
 .mono { font-family: monospace; }
 
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.75);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-  padding: 20px;
-}
-.modal {
-  background: var(--bg-card);
-  border-radius: 16px;
-  width: 100%;
-  max-width: 420px;
-  max-height: 90vh;
-  overflow-y: auto;
-}
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
+.modal { background: var(--bg-card); border-radius: 16px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
 .modal-lg { max-width: 560px; }
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 18px 20px;
-  border-bottom: 1px solid var(--border);
-}
+.modal-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--border); }
 .modal-header h3 { font-size: 17px; font-weight: 600; }
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 24px;
-  cursor: pointer;
-}
-.modal-body {
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.modal-footer {
-  display: flex;
-  gap: 12px;
-  padding: 16px 20px;
-  border-top: 1px solid var(--border);
-}
+.modal-close { background: none; border: none; color: var(--text-secondary); font-size: 24px; cursor: pointer; }
+.modal-body { padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+.modal-footer { display: flex; gap: 12px; padding: 16px 20px; border-top: 1px solid var(--border); }
 
-.form-input,
-.form-select-full {
-  width: 100%;
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 11px 14px;
-  color: var(--text-primary);
-  font-size: 14px;
-  outline: none;
-}
-.form-input:focus,
-.form-select-full:focus { border-color: var(--primary); }
+.form-input, .form-select-full { width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 11px 14px; color: var(--text-primary); font-size: 14px; outline: none; }
+.form-input:focus, .form-select-full:focus { border-color: var(--primary); }
 .form-group { display: flex; flex-direction: column; gap: 6px; }
 .form-label { font-size: 13px; color: var(--text-secondary); }
 .config-section { display: flex; flex-direction: column; gap: 8px; }
 
-.btn-cancel {
-  flex: 1;
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  padding: 11px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-.btn-confirm {
-  flex: 1;
-  background: var(--primary);
-  border: none;
-  color: white;
-  padding: 11px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-weight: 500;
-}
+.btn-cancel { flex: 1; background: var(--bg-dark); border: 1px solid var(--border); color: var(--text-primary); padding: 11px; border-radius: 8px; cursor: pointer; }
+.btn-confirm { flex: 1; background: var(--primary); border: none; color: white; padding: 11px; border-radius: 8px; cursor: pointer; font-weight: 500; }
 .btn-confirm:hover:not(:disabled) { background: var(--primary-dark); }
 .btn-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.detail-grid {
-  display: grid;
-  grid-template-columns: repeat(2,1fr);
-  gap: 12px;
-  margin-bottom: 16px;
-}
+.detail-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; margin-bottom: 16px; }
 .detail-item { display: flex; flex-direction: column; gap: 4px; }
-.detail-label {
-  font-size: 11px;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-.status-badge {
-  font-size: 12px;
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-weight: 500;
-  display: inline-block;
-}
+.detail-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+.status-badge { font-size: 12px; padding: 3px 8px; border-radius: 4px; font-weight: 500; display: inline-block; }
 .status-badge.online { background: rgba(16,185,129,0.2); color: var(--success); }
 .status-badge.offline { background: rgba(239,68,68,0.2); color: var(--danger); }
 
-.sim-edit-section {
-  border-top: 1px solid var(--border);
-  padding-top: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.sim-edit-title {
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 2px;
-}
+.sim-edit-section { border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.sim-edit-title { font-size: 13px; color: var(--text-secondary); margin-bottom: 2px; }
 
 @media (max-width: 640px) {
   .header { flex-direction: column; align-items: flex-start; }
