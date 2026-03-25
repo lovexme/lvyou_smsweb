@@ -7,15 +7,19 @@
 #
 # 运行命令：
 #   docker run -d --net=host \
+#     --restart unless-stopped \
 #     -e BMUIPASS=your_password \
 #     -v ./data:/opt/board-manager/data \
+#     --name lvyou-smsweb \
 #     lovexme/lvyou-smsweb:latest
 #
 # 自定义端口：
 #   docker run -d --net=host \
+#     --restart unless-stopped \
 #     -e BMUIPASS=your_password \
 #     -e SERVER_PORT=9000 \
 #     -v ./data:/opt/board-manager/data \
+#     --name lvyou-smsweb \
 #     lovexme/lvyou-smsweb:latest
 #
 # Docker Compose 示例：
@@ -49,6 +53,12 @@
 #   BMLOGINRATELIMIT   - 登录尝试频率限制（次/分钟）(默认: 5)
 #   BMSMSMAXLEN        - 短信内容最大长度 (默认: 500)
 #   BMALLOWORIGINS     - CORS 允许的域名，逗号分隔 (默认: 空)
+#
+# 重要提示：
+#   1. 必须使用 --net=host 网络模式，否则无法扫描局域网设备
+#   2. 建议使用 --restart unless-stopped 确保容器自动重启
+#   3. 确保 Docker 服务开机自启：sudo systemctl enable docker
+#   4. 数据持久化：使用 -v 挂载数据目录防止数据丢失
 # ========================================
 
 FROM python:3.11-slim

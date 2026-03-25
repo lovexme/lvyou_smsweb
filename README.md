@@ -172,6 +172,55 @@ docker compose up -d
 - 健康检查集成
 - Docker Hub 推送支持
 
+#### 重要配置说明
+
+**1. 网络配置（关键）**
+- **必须使用 `--net=host` 网络模式**：容器需要直接访问主机网络接口才能扫描局域网设备
+- **不能使用 bridge 网络**：bridge网络会隔离容器，导致无法发现局域网设备
+- **Docker Compose 配置**：确保 `network_mode: host` 设置
+
+**2. 开机自启配置**
+容器使用 `--restart unless-stopped` 策略后，还需要确保 Docker 服务本身开机启动：
+
+```bash
+# Ubuntu/Debian 系统
+sudo systemctl enable docker
+
+# CentOS/RHEL 系统
+sudo systemctl enable docker
+
+# 检查 Docker 服务状态
+sudo systemctl status docker
+
+# 设置 Docker 服务开机自启
+sudo systemctl enable --now docker
+```
+
+**3. 完整运行示例**
+```bash
+# 完整命令，包含网络模式和重启策略
+docker run -d --net=host \
+  --restart unless-stopped \
+  -e BMUIPASS=your_password \
+  -e BMSMSRATELIMIT=10 \
+  -e BMDIALRATELIMIT=5 \
+  -e BMLOGINRATELIMIT=5 \
+  -v ./data:/opt/board-manager/data \
+  --name lvyou-smsweb \
+  lovexme/lvyou-smsweb:latest
+```
+
+**4. 验证网络连接**
+启动后验证容器能否访问局域网：
+```bash
+# 进入容器
+docker exec -it lvyou-smsweb bash
+
+# 在容器内测试网络
+ping 192.168.1.1  # 替换为你的网关地址
+ip addr show      # 查看网络接口
+```
+
 ## 卸载
 
 ### 脚本安装卸载
