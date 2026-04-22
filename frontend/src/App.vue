@@ -39,9 +39,6 @@ const wifiSsid = ref('')
 const wifiPwd = ref('')
 const deviceDetail = ref(null)
 
-const upgradeMode = ref('online')
-const upgradeUrl = ref('')
-
 const configStep = ref('read')
 const configData = ref([])
 const configPattern = ref('')
@@ -567,34 +564,29 @@ function openUpgradeModal() {
     setNotice('请先勾选设备', 'err')
     return
   }
-  upgradeMode.value = 'online'
-  upgradeUrl.value = ''
   showUpgradeModal.value = true
 }
 
 function closeUpgradeModal() {
   showUpgradeModal.value = false
-  upgradeMode.value = 'online'
-  upgradeUrl.value = ''
 }
 
 async function applyUpgrade() {
   if (!selectedCount.value) return
-  if (upgradeMode.value === 'url' && !upgradeUrl.value.trim()) {
-    setNotice('请输入固件下载地址', 'err')
-    return
-  }
-  const mode = upgradeMode.value === 'url' ? `URL: ${upgradeUrl.value}` : '在线升级'
-  if (!confirm(`确认对 ${selectedCount.value} 台设备执行${mode}?\n升级后设备会自动重启。`)) return
+  if (!confirm(`确认对 ${selectedCount.value} 台设备检查并升级？\n有新版本的设备将自动升级并重启。`)) return
   loading.value = true
   try {
     const resp = await api.post('/api/devices/batch/upgrade', {
-      device_ids: selectedIds.value,
-      url: upgradeMode.value === 'url' ? upgradeUrl.value.trim() : ''
+      device_ids: selectedIds.value
     })
     const results = resp.data && resp.data.results || []
-    const okCount = results.filter(r => r.ok).length
-    setNotice(`升级请求已发送: ${okCount}/${results.length} 成功`, okCount ? 'ok' : 'err')
+    const okCount = results.filter(r => r.ok && !r.skipped).length
+    const skippedCount = results.filter(r => r.skipped).length
+    const failCount = results.filter(r => !r.ok).length
+    let msg = `升级完成: ${okCount} 台已升级`
+    if (skippedCount) msg += `, ${skippedCount} 台已是最新`
+    if (failCount) msg += `, ${failCount} 台失败`
+    setNotice(msg, failCount ? 'warn' : 'ok')
     closeUpgradeModal()
   } catch (e) {
     setNotice((e && e.response && e.response.data && e.response.data.detail) || '升级失败', 'err')
@@ -996,22 +988,11 @@ function diffLines(original, replaced) {
             <button class="modal-close" @click="closeUpgradeModal">×</button>
           </div>
           <div class="modal-body">
-            <p class="config-info">将对 {{ selectedCount }} 台设备执行升级，升级后设备会自动重启。</p>
-            <div class="radio-group">
-              <label class="radio-label">
-                <input type="radio" v-model="upgradeMode" value="online" />
-                <span>在线升级（设备联网下载）</span>
-              </label>
-              <label class="radio-label">
-                <input type="radio" v-model="upgradeMode" value="url" />
-                <span>指定固件 URL</span>
-              </label>
-            </div>
-            <input v-if="upgradeMode === 'url'" v-model="upgradeUrl" class="form-input" placeholder="固件下载地址 (http://...)" />
+            <p class="config-info">将对 {{ selectedCount }} 台设备检查更新，有新版本的设备将自动升级并重启。</p>
           </div>
           <div class="modal-footer">
             <button class="btn-cancel" @click="closeUpgradeModal">取消</button>
-            <button class="btn-confirm" @click="applyUpgrade" :disabled="loading || (upgradeMode === 'url' && !upgradeUrl.trim())">确认升级</button>
+            <button class="btn-confirm" @click="applyUpgrade" :disabled="loading">检查并升级</button>
           </div>
         </div>
       </div>

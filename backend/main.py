@@ -484,8 +484,7 @@ def get_wifi_info(ip: str, user: str, pw: str) -> Dict[str, str]:
 
 
 def read_device_config(ip: str, user: str, pw: str) -> Optional[str]:
-    keys_list = ["PROF"]
-    body = f"keys={json.dumps({'keys': keys_list}, ensure_ascii=False)}"
+    body = f"keys={json.dumps(['PROF'])}"
     try:
         with httpx.Client(timeout=TIMEOUT + 5, follow_redirects=False) as client:
             resp = client.post(
@@ -498,7 +497,10 @@ def read_device_config(ip: str, user: str, pw: str) -> Optional[str]:
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-                    return data["data"].get("PROF", "")
+                    prof = data["data"].get("PROF", "")
+                    if isinstance(prof, str):
+                        return prof
+                    return json.dumps(prof, ensure_ascii=False)
     except Exception:
         pass
     return None
@@ -755,15 +757,6 @@ class ScanStartReq(BaseModel):
 
 class BatchUpgradeReq(BaseModel):
     device_ids: List[int]
-    url:        str = ""
-
-    @field_validator("url")
-    @classmethod
-    def _check_url(cls, v):
-        v = (v or "").strip()
-        if v and not v.startswith(("http://", "https://")):
-            raise ValueError("固件URL必须以 http:// 或 https:// 开头")
-        return v
 
 
 class BatchConfigReadReq(BaseModel):
@@ -1364,26 +1357,24 @@ def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
 
 # ── OTA 升级 ─────────────────────────────────────────────────────────────────
 
-def upgrade_task_sync(device: Device, url: str) -> Dict[str, Any]:
+def upgrade_task_sync(device: Device) -> Dict[str, Any]:
     ip   = device.ip
     user = (device.user   or DEFAULTUSER).strip()
     pw   = (device.passwd or DEFAULTPASS).strip()
     try:
+        # 先检查有没有新版本
+        ota_info = check_ota_update(ip, user, pw)
+        if not ota_info.get("hasUpdate"):
+            return {"id": device.id, "ip": ip, "ok": True, "skipped": True, "message": "已是最新版本"}
+        # 有新版本，执行在线升级
         with httpx.Client(timeout=TIMEOUT + 30, follow_redirects=False) as client:
-            if url:
-                resp = client.get(
-                    f"http://{ip}/ota",
-                    params={"a": "do_upgrade", "url": url},
-                    auth=httpx.DigestAuth(user, pw),
-                )
-            else:
-                resp = client.get(
-                    f"http://{ip}/ota",
-                    params={"a": "updOtaOnline"},
-                    auth=httpx.DigestAuth(user, pw),
-                )
+            resp = client.get(
+                f"http://{ip}/ota",
+                params={"a": "updOtaOnline"},
+                auth=httpx.DigestAuth(user, pw),
+            )
             return {"id": device.id, "ip": ip, "ok": resp.status_code == 200,
-                    "mode": "url" if url else "online"}
+                    "newVer": ota_info.get("newVer", "")}
     except Exception as exc:
         logger.warning("ota upgrade %s failed: %s", ip, exc)
         return {"id": device.id, "ip": ip, "ok": False, "error": "升级请求失败，设备可能正在重启"}
@@ -1394,9 +1385,9 @@ def api_batch_upgrade(req: BatchUpgradeReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    _audit("batch_upgrade", detail=f"count={len(devices)} url={req.url or 'online'}")
+    _audit("batch_upgrade", detail=f"count={len(devices)}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        results = list(executor.map(lambda item: upgrade_task_sync(item, req.url), devices))
+        results = list(executor.map(upgrade_task_sync, devices))
     return {"results": results}
 
 
