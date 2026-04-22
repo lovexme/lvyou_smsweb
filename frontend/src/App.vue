@@ -61,20 +61,20 @@ function clearToken() {
 
 function saveAuth(token, expiresIn) {
   const expiresAt = Date.now() + (expiresIn * 1000)
-  sessionStorage.setItem(TOKEN_KEY, token)
-  sessionStorage.setItem(TOKEN_EXPIRES_KEY, String(expiresAt))
+  localStorage.setItem(TOKEN_KEY, token)
+  localStorage.setItem(TOKEN_EXPIRES_KEY, String(expiresAt))
   setToken(token)
 }
 
 function clearStoredAuth() {
-  sessionStorage.removeItem(TOKEN_KEY)
-  sessionStorage.removeItem(TOKEN_EXPIRES_KEY)
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(TOKEN_EXPIRES_KEY)
   clearToken()
 }
 
 function restoreAuth() {
-  const token = sessionStorage.getItem(TOKEN_KEY)
-  const expiresAt = parseInt(sessionStorage.getItem(TOKEN_EXPIRES_KEY) || '0', 10)
+  const token = localStorage.getItem(TOKEN_KEY)
+  const expiresAt = parseInt(localStorage.getItem(TOKEN_EXPIRES_KEY) || '0', 10)
   if (!token || !expiresAt || Date.now() >= expiresAt) {
     clearStoredAuth()
     return false
@@ -231,7 +231,8 @@ async function refresh() {
 }
 
 function toggleSelectAll() {
-  selectedIds.value = selectAll.value ? filteredDevices.value.map(device => device.id) : []
+  const isAllSelected = selectedCount.value === filteredDevices.value.length && filteredDevices.value.length > 0
+  selectedIds.value = isAllSelected ? [] : filteredDevices.value.map(device => device.id)
 }
 
 // FIX: 凭据改为 POST Body；用 completed 标志防止超时误判
@@ -651,9 +652,23 @@ async function saveSimSingle() {
         </div>
       </div>
 
-      <div v-if="selectedCount > 0" class="batch-bar">
-        <span class="batch-count">已选择 {{ selectedCount }} 台设备</span>
-        <button class="batch-cancel" @click="selectedIds = []; selectAll = false">取消选择</button>
+      <div class="select-bar">
+        <label class="select-all-label">
+          <span :class="['checkbox', { checked: selectedCount > 0 && selectedCount === filteredDevices.length }]">
+            {{ selectedCount > 0 && selectedCount === filteredDevices.length ? '✓' : (selectedCount > 0 ? '−' : '') }}
+          </span>
+          <input
+            type="checkbox"
+            :checked="selectedCount === filteredDevices.length && filteredDevices.length > 0"
+            :indeterminate="selectedCount > 0 && selectedCount < filteredDevices.length"
+            @change="toggleSelectAll"
+            style="display: none"
+          />
+          <span class="select-text">
+            {{ selectedCount > 0 ? `已选择 ${selectedCount} 台` : '全选' }}
+          </span>
+        </label>
+        <button v-if="selectedCount > 0" class="batch-cancel" @click="selectedIds = []; selectAll = false">取消选择</button>
       </div>
 
       <div class="tab-bar">
@@ -904,6 +919,14 @@ body {
 
 .batch-bar { background: var(--primary); color: white; padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
 .batch-cancel { background: rgba(255,255,255,0.2); border: none; color: white; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+
+.select-bar { background: var(--bg-card); padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--border); }
+.select-all-label { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.select-all-label .checkbox { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 2px solid var(--border); border-radius: 4px; font-size: 12px; color: white; background: var(--bg-dark); }
+.select-all-label .checkbox.checked { background: var(--primary); border-color: var(--primary); }
+.select-text { font-size: 14px; color: var(--text-primary); }
+.select-bar .batch-cancel { background: var(--bg-dark); border: 1px solid var(--border); color: var(--text-primary); padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+.select-bar .batch-cancel:hover { background: var(--bg-card-hover); }
 
 .tab-bar { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
 .tab-btn { background: none; border: none; color: var(--text-secondary); padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
