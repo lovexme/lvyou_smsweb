@@ -31,8 +31,12 @@ services:
       - BMALLOWORIGINS=${BMALLOWORIGINS:-}
     volumes:
       - ./data:/opt/board-manager/data
+    # FIX(P1#15): use the CMD-SHELL form so ${SERVER_PORT} is resolved inside
+    # the container at runtime (the previous list form ran curl directly with
+    # no shell, and ${SERVER_PORT} was only expanded by docker-compose at
+    # parse time against the host environment, which often left it empty).
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${SERVER_PORT}/api/health"]
+      test: ["CMD-SHELL", "curl -f \"http://localhost:$$SERVER_PORT/api/health\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -75,6 +75,15 @@ else
   log_warn "${CONFIG_FILE} 不存在，跳过"
 fi
 
+title "删除命令行工具"
+
+if [[ -f /usr/local/bin/lvyou ]]; then
+  rm -f /usr/local/bin/lvyou
+  log_info "已删除 lvyou 命令"
+else
+  log_warn "/usr/local/bin/lvyou 不存在，跳过"
+fi
+
 title "完成"
 
 log_info "卸载完成"

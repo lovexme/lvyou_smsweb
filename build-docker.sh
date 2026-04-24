@@ -8,7 +8,7 @@ set -e
 # 默认配置
 IMAGE_NAME="lovexme/lvyou-smsweb"
 TAG="latest"
-VERSION="3.4.0"
+VERSION="5.0"
 PLATFORMS="linux/amd64,linux/arm64"
 BUILD_ARGS=""
 PUSH=false

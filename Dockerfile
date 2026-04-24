@@ -89,14 +89,15 @@ WORKDIR /app
 COPY backend/requirements.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# 复制前端依赖
-COPY frontend/package.json /app/frontend/
+# 复制前端依赖（FIX(P1#14): 使用 pnpm + pnpm-lock.yaml，保证与仓库一致的依赖树）
+COPY frontend/package.json frontend/pnpm-lock.yaml /app/frontend/
 
 # 安装前端依赖并构建
 WORKDIR /app/frontend
-RUN npm install
+RUN npm install -g pnpm@9 \
+    && pnpm install --frozen-lockfile
 COPY frontend/ /app/frontend/
-RUN npm run build
+RUN pnpm run build
 
 # 回到应用目录
 WORKDIR /app

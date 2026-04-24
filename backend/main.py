@@ -8,7 +8,7 @@ import secrets
 import subprocess
 import time
 from datetime import datetime
-from ipaddress import ip_address, ip_network, IPv4Network
+from ipaddress import ip_address, ip_network, IPv4Network, IPv4Address, IPv6Address
 from typing import Any, Dict, List, Optional, Tuple
 from itertools import islice
 from contextlib import asynccontextmanager
@@ -49,8 +49,12 @@ SCAN_TTL           = int(os.environ.get("BMSCANTTL",         str(3600)))
 UIUSER             = os.environ.get("BMUIUSER",  "admin")
 UIPASS             = os.environ.get("BMUIPASS",  "admin")
 TOKEN_TTL_SECONDS  = int(os.environ.get("BMTOKENTTL", str(8 * 60 * 60)))
+PREWARM_CONCURRENCY = int(os.environ.get("BMPREWARMCONCURRENCY", "64"))
+OTA_BATCH_MAX      = int(os.environ.get("BMOTABATCHMAX",       "64"))
+TRUSTED_PROXY_HOPS = int(os.environ.get("BMTRUSTEDPROXYHOPS",  "0"))
 
-ACTIVE_TOKENS: Dict[str, Dict[str, Any]] = {}
+# FIX(P1#17): magic string -> named constant
+FORWARD_METHOD_BASIC = "99"
 
 Base = declarative_base()
 engine = create_engine(
@@ -74,11 +78,25 @@ class Device(Base):
     lastSeen     = Column(BigInteger,  default=0)
     sim1number   = Column(String(32),  default="")
     sim1operator = Column(String(64),  default="")
+    sim1signal   = Column(Integer,     default=0)
     sim2number   = Column(String(32),  default="")
     sim2operator = Column(String(64),  default="")
+    sim2signal   = Column(Integer,     default=0)
     token        = Column(Text,        default="")
+    # FIX(N3): dedicated column for firmware version so OTA check never
+    # overwrites the device's stable identifier (devId).
+    firmware_version = Column(String(64), default="")
     alias        = Column(String(128), default="")
     created      = Column(String(32),  default="")
+
+
+# FIX(P0#2): persist auth tokens to SQLite so that multiple uvicorn processes
+# (e.g. the v4 and v6 listeners) share the same session store.
+class AuthToken(Base):
+    __tablename__ = "auth_tokens"
+    token    = Column(String(128), primary_key=True)
+    username = Column(String(64),  default="")
+    exp      = Column(BigInteger,  default=0, index=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -111,8 +129,10 @@ class RateLimiter:
 
 _sms_limiter  = RateLimiter(int(os.environ.get("BMSMSRATELIMIT",  "10")), float(os.environ.get("BMSMSRATEPERIOD",  "60")))
 _dial_limiter = RateLimiter(int(os.environ.get("BMDIALRATELIMIT",  "5")), float(os.environ.get("BMDIALRATEPERIOD", "60")))
-# FIX: 登录频率限制，防止暴力破解
+# FIX: login brute-force rate limiter
 _login_limiter= RateLimiter(int(os.environ.get("BMLOGINRATELIMIT", "5")), float(os.environ.get("BMLOGINRATEPERIOD","60")))
+# FIX(N5): OTA batch rate limiter (per user), prevents using it as an internal reboot-storm
+_ota_limiter  = RateLimiter(int(os.environ.get("BMOTARATELIMIT",  "4")), float(os.environ.get("BMOTARATEPERIOD",  "60")))
 
 PHONE_RE    = re.compile(r"^\+?[0-9]{5,15}$")
 SMS_MAX_LEN = int(os.environ.get("BMSMSMAXLEN", "500"))
@@ -141,15 +161,19 @@ def _audit(action: str, user: str = "-", detail: str = ""):
     _audit_logger.info("action=%s user=%s detail=%s", action, user, detail)
 
 
+# FIX(P1#16): only swallow truly unhandled Exceptions. HTTPExceptions
+# originate from validation / auth code paths and should keep their intended
+# status codes; Starlette's default handler already handles them correctly.
 def _setup_exception_handlers(_app: FastAPI):
     @_app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
+        if isinstance(exc, HTTPException):
+            raise exc
         err_id = _uuid.uuid4().hex[:8]
         logger.error("unhandled [%s] %s %s: %s", err_id, request.method, request.url.path, exc, exc_info=True)
         return JSONResponse(status_code=500, content={"detail": f"服务器内部错误 (ref: {err_id})"})
 
 
-# FIX: 新增 finished_at / mark_done()，用于自动清理
 class ScanState:
     def __init__(self):
         self.status    = "pending"
@@ -161,6 +185,35 @@ class ScanState:
         self.cidr      = ""
         self.finished_at: float = 0.0
         self._lock     = _Lock()
+
+    # FIX(P1#7): all mutators serialised under the same lock used by to_dict
+    def set_status(self, status: str, progress: Optional[str] = None) -> None:
+        with self._lock:
+            self.status = status
+            if progress is not None:
+                self.progress = progress
+
+    def set_progress(self, progress: str) -> None:
+        with self._lock:
+            self.progress = progress
+
+    def set_counts(self, *, scanned: Optional[int] = None, found: Optional[int] = None, total_ips: Optional[int] = None) -> None:
+        with self._lock:
+            if scanned is not None:
+                self.scanned = scanned
+            if found is not None:
+                self.found = found
+            if total_ips is not None:
+                self.total_ips = total_ips
+
+    def set_results(self, results: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.results = results
+            self.found = len(results)
+
+    def set_cidr(self, cidr: str) -> None:
+        with self._lock:
+            self.cidr = cidr
 
     def mark_done(self) -> None:
         with self._lock:
@@ -180,24 +233,33 @@ class ScanState:
 
 
 _active_scans: Dict[str, ScanState] = {}
+_active_scans_lock = _Lock()
 
 
-# FIX: 自动清理超期已完成的扫描任务，防止内存泄漏
 def _cleanup_old_scans() -> None:
     now = time.time()
-    expired = [sid for sid, st in list(_active_scans.items())
-               if st.finished_at > 0 and now - st.finished_at > SCAN_TTL]
-    for sid in expired:
-        _active_scans.pop(sid, None)
+    with _active_scans_lock:
+        expired = [sid for sid, st in _active_scans.items()
+                   if st.finished_at > 0 and now - st.finished_at > SCAN_TTL]
+        for sid in expired:
+            _active_scans.pop(sid, None)
 
 
 def _run_migrations():
+    """Idempotent ALTER TABLE migrations for columns added across versions."""
+    alters = [
+        ("devices", "token",            "TEXT DEFAULT ''"),
+        ("devices", "sim1signal",       "INTEGER DEFAULT 0"),
+        ("devices", "sim2signal",       "INTEGER DEFAULT 0"),
+        ("devices", "firmware_version", "VARCHAR(64) DEFAULT ''"),
+    ]
     with engine.connect() as conn:
-        rows = conn.execute(text("PRAGMA table_info(devices)")).fetchall()
-        cols = [r[1] for r in rows]
-        if "token" not in cols:
-            conn.execute(text("ALTER TABLE devices ADD COLUMN token TEXT DEFAULT ''"))
-            conn.commit()
+        for table, col, coltype in alters:
+            rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            cols = [r[1] for r in rows]
+            if col not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+        conn.commit()
 
 
 _run_migrations()
@@ -215,17 +277,54 @@ def nowts() -> int:
     return int(time.time())
 
 
+# ── Token persistence (SQLite-backed, shared across processes) ───────────────
 def _cleanup_expired_tokens() -> None:
-    now = nowts()
-    expired = [t for t, p in ACTIVE_TOKENS.items() if p.get("exp", 0) <= now]
-    for t in expired:
-        ACTIVE_TOKENS.pop(t, None)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM auth_tokens WHERE exp <= :n"), {"n": nowts()})
+    except Exception:
+        logger.debug("token cleanup failed", exc_info=True)
+
+
+def _get_token_record(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT username, exp FROM auth_tokens WHERE token = :t"),
+                {"t": token},
+            ).first()
+            if not row:
+                return None
+            return {"username": row[0] or "", "exp": int(row[1] or 0)}
+    except Exception:
+        logger.debug("token lookup failed", exc_info=True)
+        return None
+
+
+def _insert_token(token: str, username: str, exp: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT OR REPLACE INTO auth_tokens(token, username, exp) VALUES(:t, :u, :e)"),
+            {"t": token, "u": username, "e": exp},
+        )
+
+
+def _delete_token(token: str) -> None:
+    if not token:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM auth_tokens WHERE token = :t"), {"t": token})
+    except Exception:
+        logger.debug("token delete failed", exc_info=True)
 
 
 def _issue_token(username: str) -> str:
     _cleanup_expired_tokens()
     token = secrets.token_urlsafe(32)
-    ACTIVE_TOKENS[token] = {"username": username, "exp": nowts() + TOKEN_TTL_SECONDS}
+    _insert_token(token, username, nowts() + TOKEN_TTL_SECONDS)
     return token
 
 
@@ -241,15 +340,14 @@ def _unauthorized_json(detail: str = "未登录或登录已失效") -> JSONRespo
 
 
 def _require_token(request: Request) -> Dict[str, Any]:
-    _cleanup_expired_tokens()
     token = _extract_bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="未登录或登录已失效")
-    payload = ACTIVE_TOKENS.get(token)
+    payload = _get_token_record(token)
     if not payload:
         raise HTTPException(status_code=401, detail="未登录或登录已失效")
     if payload.get("exp", 0) <= nowts():
-        ACTIVE_TOKENS.pop(token, None)
+        _delete_token(token)
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
     return payload
 
@@ -258,31 +356,131 @@ def _check_login_credentials(username: str, password: str) -> bool:
     return hmac.compare_digest(username, UIUSER) and hmac.compare_digest(password, UIPASS)
 
 
+def _client_ip(request: Request) -> str:
+    """Resolve real client IP honouring X-Forwarded-For when behind a trusted
+    reverse proxy. Set BMTRUSTEDPROXYHOPS >= 1 to read the header."""
+    if TRUSTED_PROXY_HOPS > 0:
+        xff = request.headers.get("x-forwarded-for", "") or request.headers.get("X-Forwarded-For", "")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                idx = max(0, len(parts) - TRUSTED_PROXY_HOPS)
+                return parts[idx]
+        real = request.headers.get("x-real-ip", "") or request.headers.get("X-Real-IP", "")
+        if real:
+            return real.strip()
+    return request.client.host if request.client else "unknown"
+
+
+# ── Shared httpx client + executor (managed by lifespan) ─────────────────────
+_sync_client: Optional[httpx.Client] = None
+_shared_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_cleanup_task: Optional[asyncio.Task] = None
+
+
+def _get_sync_client() -> httpx.Client:
+    """Return the shared sync client; fall back to creating a fresh one if the
+    lifespan manager has not run yet (e.g. during tests)."""
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = httpx.Client(
+            timeout=TIMEOUT,
+            limits=httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=20),
+            follow_redirects=False,
+        )
+    return _sync_client
+
+
+def _get_shared_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _shared_executor
+    if _shared_executor is None:
+        _shared_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(CONCURRENCY, 32))
+    return _shared_executor
+
+
+async def _scan_cleanup_loop() -> None:
+    while True:
+        try:
+            _cleanup_old_scans()
+            _cleanup_expired_tokens()
+        except Exception:
+            logger.debug("background cleanup error", exc_info=True)
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _sync_client, _shared_executor, _cleanup_task
+    # FIX(P1#9): one sync client for the whole process, connection pooled.
+    _sync_client = httpx.Client(
+        timeout=TIMEOUT,
+        limits=httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=20),
+        follow_redirects=False,
+    )
+    # FIX(P1#10): one ThreadPoolExecutor for all batch endpoints / scans.
+    _shared_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(CONCURRENCY, 32))
     app.state.http_client = httpx.AsyncClient(
         timeout=TIMEOUT,
         limits=httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=20),
         follow_redirects=False,
     )
-    yield
-    await app.state.http_client.aclose()
+    app.state.sync_http_client = _sync_client
+    app.state.executor = _shared_executor
+    # FIX(P1#12): periodic cleanup task for finished scan tasks and expired tokens.
+    _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+    try:
+        yield
+    finally:
+        if _cleanup_task:
+            _cleanup_task.cancel()
+            try:
+                await _cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await app.state.http_client.aclose()
+        except Exception:
+            pass
+        try:
+            _sync_client.close()
+        except Exception:
+            pass
+        try:
+            _shared_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Board LAN Hub", version="3.4.0", lifespan=lifespan)
 _setup_exception_handlers(app)
 
-_raw_origins = os.environ.get("BMALLOWORIGINS", "")
-ALLOW_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()] or []
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
-)
 
-_PUBLIC_PATHS = {"/", "/api/login"}
+def _configure_cors(_app: FastAPI) -> None:
+    raw = os.environ.get("BMALLOWORIGINS", "")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    # FIX(P0#6): refuse the insecure combination of wildcard origin with
+    # credentials. Starlette silently allows it but browsers will reject the
+    # response, which bakes a subtle CSRF-enabling footgun into the API.
+    if "*" in origins:
+        raise RuntimeError(
+            "BMALLOWORIGINS='*' is incompatible with allow_credentials=True. "
+            "Either specify explicit origins or unset BMALLOWORIGINS."
+        )
+    _app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+
+_configure_cors(app)
+
+
+# FIX(P0#1): expose /api/health so container/compose HEALTHCHECK works without
+# needing a Bearer token. The endpoint returns only liveness info.
+_PUBLIC_PATHS = {"/", "/api/login", "/api/health"}
 
 
 @app.middleware("http")
@@ -309,30 +507,37 @@ def uiindex():
     return FileResponse(index_path)
 
 
-def sh(cmd: List[str]) -> str:
-    return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+# FIX(P0#5): never invoke a shell. Each helper below feeds argv directly to
+# subprocess; no user-controllable values are passed.
+def _run(argv: List[str], timeout: float = 3.0) -> str:
+    return subprocess.check_output(argv, stderr=subprocess.DEVNULL, text=True, timeout=timeout).strip()
 
 
 def guessipv4cidr() -> str:
     try:
-        route_text = sh(["bash", "-lc", "ip -4 route show default 2>/dev/null | head -n1"])
-        match = re.search(r"dev\s+(\S+)", route_text)
-        if match:
+        route_text = _run(["ip", "-4", "route", "show", "default"])
+        for line in route_text.splitlines():
+            match = re.search(r"dev\s+(\S+)", line)
+            if not match:
+                continue
             iface = match.group(1)
-            addr = sh(["bash", "-lc", f"ip -4 addr show dev {iface} | awk '/inet /{{print $2; exit}}'"])
-            if addr:
-                net = ip_network(addr, strict=False)
-                if isinstance(net, IPv4Network):
-                    return f"{net.network_address}/{net.prefixlen}"
+            addr_text = _run(["ip", "-4", "addr", "show", "dev", iface])
+            for addr_line in addr_text.splitlines():
+                m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", addr_line)
+                if m:
+                    net = ip_network(m.group(1), strict=False)
+                    if isinstance(net, IPv4Network):
+                        return f"{net.network_address}/{net.prefixlen}"
+            break
     except Exception:
         pass
     try:
-        txt = sh(["bash", "-lc", "ip -o -4 addr show | awk '{print $2, $4}'"])
+        txt = _run(["ip", "-o", "-4", "addr", "show"])
         for line in txt.splitlines():
             parts = line.strip().split()
-            if len(parts) != 2:
+            if len(parts) < 4:
                 continue
-            iface, cidr = parts
+            iface, cidr = parts[1], parts[3]
             if iface == "lo":
                 continue
             net = ip_network(cidr, strict=False)
@@ -341,6 +546,63 @@ def guessipv4cidr() -> str:
     except Exception:
         pass
     return "192.168.1.0/24"
+
+
+def _local_ipv4_networks() -> List[IPv4Network]:
+    nets: List[IPv4Network] = []
+    try:
+        txt = _run(["ip", "-o", "-4", "addr", "show"])
+        for line in txt.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 4:
+                continue
+            iface, cidr = parts[1], parts[3]
+            if iface == "lo":
+                continue
+            try:
+                net = ip_network(cidr, strict=False)
+                if isinstance(net, IPv4Network):
+                    nets.append(net)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return nets
+
+
+# FIX(P0#3): whitelist before any outbound request to a device. A device.ip
+# value either comes from scanning a local subnet or from operator input; in
+# neither case should the backend be tricked into fetching public / metadata
+# endpoints on its behalf. We accept only private addresses and — more
+# strictly — IPs that fall in one of the local interface subnets.
+def _is_device_ip_allowed(ip: str) -> bool:
+    try:
+        addr = ip_address(ip)
+    except Exception:
+        return False
+    if isinstance(addr, IPv4Address):
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+            return False
+        if not addr.is_private:
+            return False
+        nets = _local_ipv4_networks()
+        if not nets:
+            return True
+        for net in nets:
+            if addr in net:
+                return True
+        return False
+    if isinstance(addr, IPv6Address):
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+            return False
+        return addr.is_private or addr.is_site_local
+    return False
+
+
+def _ensure_device_ip_allowed(ip: str) -> None:
+    if not _is_device_ip_allowed(ip):
+        logger.warning("blocked outbound device request to non-whitelisted ip: %s", ip)
+        raise HTTPException(status_code=400, detail="设备 IP 不在允许的内网范围内")
 
 
 def getarptable() -> Dict[str, str]:
@@ -370,27 +632,34 @@ def getarptable() -> Dict[str, str]:
     return out
 
 
+# FIX(P1#11): cap concurrent ping subprocesses, avoiding 1024 fork()s at once.
 def prewarm_neighbors(net: IPv4Network) -> None:
     try:
         hosts = [str(host) for host in islice(net.hosts(), CIDRFALLBACKLIMIT)]
-        processes = []
-        for ip in hosts:
-            proc = subprocess.Popen(
-                ["ping", "-c", "1", "-W", "1", ip],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            processes.append(proc)
+        sem = threading.Semaphore(max(1, PREWARM_CONCURRENCY))
         deadline = time.time() + 8
-        for proc in processes:
-            remaining = max(0, deadline - time.time())
-            try:
-                proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
+
+        def _ping(ip_str: str) -> None:
+            if time.time() >= deadline:
+                return
+            with sem:
                 try:
-                    proc.kill()
+                    subprocess.run(
+                        ["ping", "-c", "1", "-W", "1", ip_str],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=max(0.5, deadline - time.time()),
+                    )
                 except Exception:
                     pass
-        time.sleep(0.5)
+
+        threads: List[threading.Thread] = []
+        for ip in hosts:
+            t = threading.Thread(target=_ping, args=(ip,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=max(0.1, deadline - time.time()))
+        time.sleep(0.2)
     except Exception:
         pass
 
@@ -407,81 +676,80 @@ def _bm_op_from_sta(sta: str) -> str:
     return (sta or "").strip()
 
 
-# FIX: requests → httpx.Client + httpx.DigestAuth
+# FIX(P1#9): reuse shared httpx.Client instead of creating one per call.
 def istargetdevice(ip: str, user: str, pw: str) -> Tuple[bool, Optional[str]]:
+    _ensure_device_ip_allowed(ip)
     url = f"http://{ip}/mgr"
     last_realm: Optional[str] = None
+    client = _get_sync_client()
     for attempt in range(max(1, SCAN_RETRIES)):
         try:
-            with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as client:
-                resp = client.get(url)
-                if resp.status_code != 401:
-                    raise RuntimeError(f"unexpected status {resp.status_code}")
-                header = resp.headers.get("www-authenticate", "")
-                if "Digest" not in header:
-                    raise RuntimeError("digest auth missing")
-                match = re.search(r'realm="([^"]+)"', header)
-                realm = match.group(1) if match else None
-                last_realm = realm
-                if realm != "asyncesp":
-                    return False, realm
-                resp2 = client.get(url, auth=httpx.DigestAuth(user, pw))
-                if resp2.status_code == 200:
-                    return True, realm
-                raise RuntimeError(f"auth status {resp2.status_code}")
+            resp = client.get(url)
+            if resp.status_code != 401:
+                raise RuntimeError(f"unexpected status {resp.status_code}")
+            header = resp.headers.get("www-authenticate", "")
+            if "Digest" not in header:
+                raise RuntimeError("digest auth missing")
+            match = re.search(r'realm="([^"]+)"', header)
+            realm = match.group(1) if match else None
+            last_realm = realm
+            if realm != "asyncesp":
+                return False, realm
+            resp2 = client.get(url, auth=httpx.DigestAuth(user, pw))
+            if resp2.status_code == 200:
+                return True, realm
+            raise RuntimeError(f"auth status {resp2.status_code}")
         except Exception as _scan_exc:
             if attempt < max(1, SCAN_RETRIES) - 1:
-                logger.debug(f"scan {ip} attempt {attempt + 1} failed: {_scan_exc}")
+                logger.debug("scan %s attempt %d failed: %s", ip, attempt + 1, _scan_exc)
                 time.sleep(max(0, SCAN_RETRY_SLEEP_MS) / 1000.0)
     return False, last_realm
 
 
-# FIX: requests → httpx.Client
 def getdevicedata(ip: str, user: str, pw: str) -> Optional[Dict[str, Any]]:
-    keys_list = ["DEV_ID", "DEV_VER", "SIM1_PHNUM", "SIM2_PHNUM", "SIM1_OP", "SIM2_OP", "SIM1_STA", "SIM2_STA"]
+    _ensure_device_ip_allowed(ip)
+    keys_list = ["DEV_ID", "DEV_VER", "SIM1_PHNUM", "SIM2_PHNUM", "SIM1_OP", "SIM2_OP", "SIM1_STA", "SIM2_STA", "SIM1_SIGNAL", "SIM2_SIGNAL", "WIFI_NAME", "WIFI_DBM"]
     body = f"keys={json.dumps({'keys': keys_list}, ensure_ascii=False)}"
     try:
-        with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as client:
-            resp = client.post(
-                f"http://{ip}/mgr",
-                params={"a": "getHtmlData_index"},
-                auth=httpx.DigestAuth(user, pw),
-                content=body.encode(),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-                return data["data"]
+        resp = _get_sync_client().post(
+            f"http://{ip}/mgr",
+            params={"a": "getHtmlData_index"},
+            auth=httpx.DigestAuth(user, pw),
+            content=body.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+            return data["data"]
     except Exception:
         pass
     return None
 
 
 def get_wifi_info(ip: str, user: str, pw: str) -> Dict[str, str]:
+    _ensure_device_ip_allowed(ip)
     keys_list = ["WIFI_NAME", "WIFI_DBM"]
     body = f"keys={json.dumps({'keys': keys_list}, ensure_ascii=False)}"
     try:
-        with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as client:
-            resp = client.post(
-                f"http://{ip}/mgr",
-                params={"a": "getHtmlData_index"},
-                auth=httpx.DigestAuth(user, pw),
-                content=body.encode(),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-                    return {
-                        "wifiName": data["data"].get("WIFI_NAME", ""),
-                        "wifiDbm": data["data"].get("WIFI_DBM", ""),
-                    }
+        resp = _get_sync_client().post(
+            f"http://{ip}/mgr",
+            params={"a": "getHtmlData_index"},
+            auth=httpx.DigestAuth(user, pw),
+            content=body.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+                return {
+                    "wifiName": data["data"].get("WIFI_NAME", ""),
+                    "wifiDbm": data["data"].get("WIFI_DBM", ""),
+                }
     except Exception:
         pass
     return {"wifiName": "", "wifiDbm": ""}
-
 
 
 def _device_to_dict(device: Device) -> Dict[str, Any]:
@@ -495,13 +763,19 @@ def _device_to_dict(device: Device) -> Dict[str, Any]:
         "status":  device.status or "unknown",
         "lastSeen":device.lastSeen or 0,
         "created": device.created or "",
+        "firmwareVersion": getattr(device, "firmware_version", "") or "",
         "sims": {
-            "sim1": {"number": device.sim1number or "", "operator": device.sim1operator or "", "label": device.sim1number or device.sim1operator or "SIM"},
-            "sim2": {"number": device.sim2number or "", "operator": device.sim2operator or "", "label": device.sim2number or device.sim2operator or "SIM"},
+            "sim1": {"number": device.sim1number or "", "operator": device.sim1operator or "", "signal": device.sim1signal or 0, "label": device.sim1number or device.sim1operator or "SIM"},
+            "sim2": {"number": device.sim2number or "", "operator": device.sim2operator or "", "signal": device.sim2signal or 0, "label": device.sim2number or device.sim2operator or "SIM"},
         },
+        "wifiName": "",
+        "wifiDbm": "",
     }
 
 
+# FIX(P1#8): robust upsert that tolerates the UNIQUE(ip) constraint without
+# silently deleting an unrelated row and without leaving the session in a
+# rolled-back state.
 def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Optional[str] = None) -> Dict[str, Any]:
     data   = getdevicedata(ip, user, pw) or {}
     devid  = (data.get("DEV_ID") or "").strip() or None
@@ -509,6 +783,9 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
     sim2num= (data.get("SIM2_PHNUM") or "").strip()
     sim1op = (data.get("SIM1_OP") or "").strip() or _bm_op_from_sta(data.get("SIM1_STA") or "")
     sim2op = (data.get("SIM2_OP") or "").strip() or _bm_op_from_sta(data.get("SIM2_STA") or "")
+    sim1sig= int(data.get("SIM1_SIGNAL") or 0)
+    sim2sig= int(data.get("SIM2_SIGNAL") or 0)
+    fw_ver = (data.get("DEV_VER") or "").strip()
     mac    = (mac or "").strip().upper() or None
 
     device: Optional[Device] = None
@@ -522,8 +799,10 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
     if device and device.ip != ip:
         other = db.query(Device).filter(Device.ip == ip).first()
         if other and other.id != device.id:
+            # Another DB row already owns the target IP (DHCP rotation).
+            # Clear its ip to release the UNIQUE slot before reassigning.
+            other.ip = f"__stale_{other.id}_{nowts()}"
             try:
-                db.delete(other)
                 db.flush()
             except Exception:
                 db.rollback()
@@ -541,24 +820,40 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
         device.lastSeen    = nowts()
         device.sim1number  = sim1num
         device.sim1operator= sim1op
+        device.sim1signal  = sim1sig
         device.sim2number  = sim2num
         device.sim2operator= sim2op
+        device.sim2signal  = sim2sig
+        if fw_ver:
+            device.firmware_version = fw_ver
     else:
         device = Device(
             devId=devid, grp=(grp if grp is not None and str(grp).strip() else "auto"),
             ip=ip, mac=(mac or ""), user=user, passwd=pw, status="online", lastSeen=nowts(),
-            sim1number=sim1num, sim1operator=sim1op, sim2number=sim2num, sim2operator=sim2op,
+            sim1number=sim1num, sim1operator=sim1op, sim1signal=sim1sig,
+            sim2number=sim2num, sim2operator=sim2op, sim2signal=sim2sig,
+            firmware_version=fw_ver,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         db.add(device)
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("upsert %s failed: %s", ip, exc)
+        return {"ip": ip, "error": "数据库写入失败"}
     db.refresh(device)
     return _device_to_dict(device)
 
 
+# FIX(N1): revert to a pure DB read. The previous implementation performed a
+# blocking HTTP call per device (O(N) outbound requests per /api/devices hit,
+# plus an SSRF amplifier); real-time status now happens via explicit
+# /detail / /refresh endpoints or the scan flow.
 def listdevices(db: Session) -> List[Dict[str, Any]]:
-    return [_device_to_dict(d) for d in db.query(Device).order_by(Device.created.desc(), Device.id.desc()).all()]
+    devices = db.query(Device).order_by(Device.created.desc(), Device.id.desc()).all()
+    return [_device_to_dict(d) for d in devices]
 
 
 def getallnumbers(db: Session) -> List[Dict[str, Any]]:
@@ -691,7 +986,6 @@ class EnhancedBatchForwardReq(BaseModel):
     lyApiUrl:      str = ""
 
 
-# FIX: 凭据通过 POST Body 传递，不再暴露于 URL Query String
 class ScanStartReq(BaseModel):
     cidr:     Optional[str] = None
     group:    Optional[str] = None
@@ -700,11 +994,11 @@ class ScanStartReq(BaseModel):
 
 
 # ── API Routes ──
-
-# FIX: 加入登录频率限制 + audit 日志
 @app.post("/api/login")
 def api_login(req: LoginReq, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
+    # FIX(P1#13): use X-Forwarded-For when running behind a trusted reverse
+    # proxy so the login rate limiter keys on the real client IP.
+    client_ip = _client_ip(request)
     if not _login_limiter.allow(client_ip):
         raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后再试")
     username = (req.username or "").strip()
@@ -719,7 +1013,7 @@ def api_login(req: LoginReq, request: Request):
 def api_logout(request: Request):
     token = _extract_bearer_token(request)
     if token:
-        ACTIVE_TOKENS.pop(token, None)
+        _delete_token(token)
     return {"ok": True}
 
 
@@ -758,14 +1052,13 @@ def api_device_detail(devid: int, db: Session = Depends(get_db)):
     payload = _device_to_dict(device)
     payload["sim1number"]   = device.sim1number or ""
     payload["sim1operator"] = device.sim1operator or ""
+    payload["sim1signal"]   = device.sim1signal or 0
     payload["sim2number"]   = device.sim2number or ""
     payload["sim2operator"] = device.sim2operator or ""
-    # 实时获取 WiFi 名称和信号强度
-    _user = (device.user or DEFAULTUSER).strip()
-    _pw   = (device.passwd or DEFAULTPASS).strip()
-    wifi_info = get_wifi_info(device.ip, _user, _pw)
-    payload["wifiName"] = wifi_info["wifiName"]
-    payload["wifiDbm"]  = wifi_info["wifiDbm"]
+    payload["sim2signal"]   = device.sim2signal or 0
+    sig_data = getdevicedata(device.ip, device.user or DEFAULTUSER, device.passwd or DEFAULTPASS) or {}
+    payload["wifiName"] = sig_data.get("WIFI_NAME", "")
+    payload["wifiDbm"]  = sig_data.get("WIFI_DBM", "")
     return {"device": payload, "forwardconfig": {}, "wifilist": []}
 
 
@@ -826,11 +1119,10 @@ def _safe_ip_in_net(ip: str, net: IPv4Network) -> bool:
 
 def _scan_worker(cidr: str, group: Optional[str], user: str, password: str, state: ScanState):
     try:
-        state.status   = "scanning"
-        state.progress = "解析网段..."
+        state.set_status("scanning", "解析网段...")
         net = ip_network(cidr, strict=False)
 
-        state.progress = "预热邻居..."
+        state.set_progress("预热邻居...")
         prewarm_neighbors(net)
         arptable = getarptable()
 
@@ -843,8 +1135,8 @@ def _scan_worker(cidr: str, group: Optional[str], user: str, password: str, stat
                 iplist.append(ip)
             if len(iplist) >= CIDRFALLBACKLIMIT:
                 break
-        state.total_ips = len(iplist)
-        state.progress  = f"TCP 探测 {len(iplist)} 个 IP..."
+        state.set_counts(total_ips=len(iplist))
+        state.set_progress(f"TCP 探测 {len(iplist)} 个 IP...")
 
         open80: List[str] = []
         olock = threading.Lock()
@@ -854,50 +1146,50 @@ def _scan_worker(cidr: str, group: Optional[str], user: str, password: str, stat
                 with olock:
                     open80.append(ip)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=TCP_CONCURRENCY) as ex:
-            list(ex.map(_tcp, iplist))
-        state.scanned  = len(open80)
-        state.progress = f"验证 {len(open80)} 台设备..."
+        # FIX(P1#10): reuse the process-wide executor.
+        executor = _get_shared_executor()
+        list(executor.map(_tcp, iplist))
+        state.set_counts(scanned=len(open80))
+        state.set_progress(f"验证 {len(open80)} 台设备...")
 
         found: List[Dict[str, Any]] = []
         flock = threading.Lock()
 
         def _probe(ip: str):
-            ok, _ = istargetdevice(ip, user, password)
+            try:
+                ok, _ = istargetdevice(ip, user, password)
+            except HTTPException:
+                return
             if ok:
                 mac = arptable.get(ip, "")
                 with flock:
                     found.append({"ip": ip, "mac": mac, "devId": "", "grp": group})
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-            list(ex.map(_probe, open80))
+        list(executor.map(_probe, open80))
 
-        state.results  = found
-        state.found    = len(found)
-        state.progress = f"完成，发现 {len(found)} 台"
+        state.set_results(found)
+        state.set_progress(f"完成，发现 {len(found)} 台")
     except Exception as exc:
-        state.status   = "error"
-        state.progress = f"扫描出错: {exc}"
+        state.set_status("error", f"扫描出错: {exc}")
         logger.error("scan error for %s: %s", cidr, exc, exc_info=True)
         return
-    state.status = "done"
+    state.set_status("done")
 
 
-# FIX: 去掉嵌套 ThreadPoolExecutor；finally 中调用 mark_done()
 def _run_scan_bg(scan_id: str, cidr: str, group: Optional[str], user: str, password: str):
-    state = _active_scans.get(scan_id)
+    with _active_scans_lock:
+        state = _active_scans.get(scan_id)
     if not state:
         return
 
-    _scan_worker(cidr, group, user, password, state)
-
-    if state.status == "error":
-        state.mark_done()
-        return
-
-    state.status   = "saving"
-    state.progress = "保存设备到数据库..."
     try:
+        _scan_worker(cidr, group, user, password, state)
+
+        if state.status == "error":
+            state.mark_done()
+            return
+
+        state.set_status("saving", "保存设备到数据库...")
         db = SessionLocal()
         try:
             saved: List[Dict[str, Any]] = []
@@ -907,15 +1199,12 @@ def _run_scan_bg(scan_id: str, cidr: str, group: Optional[str], user: str, passw
                     saved.append(d)
                 except Exception as exc:
                     logger.warning("save device %s failed: %s", item["ip"], exc)
-            state.results  = saved
-            state.found    = len(saved)
-            state.status   = "done"
-            state.progress = f"完成，发现 {len(saved)} 台设备"
+            state.set_results(saved)
+            state.set_status("done", f"完成，发现 {len(saved)} 台设备")
         finally:
             db.close()
     except Exception as exc:
-        state.status   = "error"
-        state.progress = f"保存失败: {exc}"
+        state.set_status("error", f"保存失败: {exc}")
         logger.error("scan save error: %s", exc, exc_info=True)
     finally:
         state.mark_done()
@@ -932,14 +1221,14 @@ def _submit_scan(cidr: Optional[str], group: Optional[str], user: str, password:
         raise HTTPException(status_code=400, detail=f"无效的网段: {exc}")
     scan_id = _uuid.uuid4().hex[:12]
     state = ScanState()
-    state.cidr = cidr
-    _active_scans[scan_id] = state
+    state.set_cidr(cidr)
+    with _active_scans_lock:
+        _active_scans[scan_id] = state
     background_tasks.add_task(_run_scan_bg, scan_id, cidr, group, user, password)
     _audit("scan_start", detail=f"cidr={cidr}")
     return scan_id
 
 
-# FIX: 凭据改为 POST Body；BackgroundTasks 由框架注入，去掉错误默认值
 @app.post("/api/scan/start")
 def scanstart(req: ScanStartReq, background_tasks: BackgroundTasks):
     user     = req.user.strip()     or DEFAULTUSER
@@ -948,17 +1237,16 @@ def scanstart(req: ScanStartReq, background_tasks: BackgroundTasks):
     return {"ok": True, "scanId": scan_id}
 
 
-# FIX: 调用 _cleanup_old_scans() 防止内存泄漏
 @app.get("/api/scan/status/{scan_id}")
 def scanstatus(scan_id: str):
     _cleanup_old_scans()
-    state = _active_scans.get(scan_id)
+    with _active_scans_lock:
+        state = _active_scans.get(scan_id)
     if not state:
         raise HTTPException(status_code=404, detail="扫描任务不存在")
     return state.to_dict()
 
 
-# FIX: requests → httpx
 @app.post("/api/sms/send-direct")
 def smssenddirect(req: DirectSmsReq, request: Request, db: Session = Depends(get_db)):
     if req.slot not in (1, 2):
@@ -973,18 +1261,19 @@ def smssenddirect(req: DirectSmsReq, request: Request, db: Session = Depends(get
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     ip   = device.ip
+    _ensure_device_ip_allowed(ip)
     user = (device.user   or DEFAULTUSER).strip()
     pw   = (device.passwd or DEFAULTPASS).strip()
     try:
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
             raise HTTPException(status_code=400, detail="设备认证失败")
-        with httpx.Client(timeout=TIMEOUT + 3, follow_redirects=False) as client:
-            resp = client.get(
-                f"http://{ip}/mgr",
-                params={"a": "sendsms", "sid": str(req.slot), "phone": phone, "content": content},
-                auth=httpx.DigestAuth(user, pw),
-            )
+        resp = _get_sync_client().get(
+            f"http://{ip}/mgr",
+            params={"a": "sendsms", "sid": str(req.slot), "phone": phone, "content": content},
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 3,
+        )
         if resp.status_code == 200:
             try:
                 body = resp.json()
@@ -1002,25 +1291,73 @@ def smssenddirect(req: DirectSmsReq, request: Request, db: Session = Depends(get
         return {"ok": False, "error": "短信发送失败，请稍后重试"}
 
 
-# FIX: requests → httpx
-def wifi_task_sync(device: Device, ssid: str, pwd: str) -> Dict[str, Any]:
-    ip   = device.ip
-    user = (device.user   or DEFAULTUSER).strip()
-    pw   = (device.passwd or DEFAULTPASS).strip()
+def wifi_task_sync(device_info: Dict[str, Any], ssid: str, pwd: str) -> Dict[str, Any]:
+    ip   = device_info["ip"]
+    user = device_info["user"]
+    pw   = device_info["pw"]
     try:
+        _ensure_device_ip_allowed(ip)
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
-            return {"id": device.id, "ip": ip, "ok": False, "error": "设备认证失败"}
-        with httpx.Client(timeout=TIMEOUT + 5, follow_redirects=False) as client:
-            resp = client.get(
-                f"http://{ip}/ap",
-                params={"a": "apadd", "ssid": ssid, "pwd": pwd},
-                auth=httpx.DigestAuth(user, pw),
-            )
-        return {"id": device.id, "ip": ip, "ok": resp.status_code == 200}
+            return {"id": device_info["id"], "ip": ip, "ok": False, "error": "设备认证失败"}
+        resp = _get_sync_client().get(
+            f"http://{ip}/ap",
+            params={"a": "apadd", "ssid": ssid, "pwd": pwd},
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 5,
+        )
+        return {"id": device_info["id"], "ip": ip, "ok": resp.status_code == 200}
+    except HTTPException as exc:
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
     except Exception as exc:
         logger.warning("wifi config %s failed: %s", ip, exc)
-        return {"id": device.id, "ip": ip, "ok": False, "error": "WiFi配置失败"}
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "WiFi配置失败"}
+
+
+def _device_conn_info(device: Device) -> Dict[str, Any]:
+    return {
+        "id": device.id,
+        "ip": device.ip,
+        "alias": device.alias or "",
+        "grp": device.grp or "auto",
+        "user": (device.user or DEFAULTUSER).strip(),
+        "pw":   (device.passwd or DEFAULTPASS).strip(),
+    }
+
+
+# FIX(N7): real preview that actually fetches the current WiFi from each
+# device (was a fake hardcoded "(待获取)" value that the frontend then forced
+# operators to click through).
+@app.post("/api/devices/batch/wifi/preview")
+def api_batch_wifi_preview(req: BatchWifiReq, db: Session = Depends(get_db)):
+    if not req.device_ids:
+        raise HTTPException(status_code=400, detail="device_ids required")
+    devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
+    infos = [_device_conn_info(d) for d in devices]
+
+    def _preview(info: Dict[str, Any]) -> Dict[str, Any]:
+        current = ""
+        try:
+            _ensure_device_ip_allowed(info["ip"])
+            wifi = get_wifi_info(info["ip"], info["user"], info["pw"])
+            current = wifi.get("wifiName", "")
+        except HTTPException:
+            current = ""
+        except Exception:
+            current = ""
+        return {
+            "id": info["id"],
+            "ip": info["ip"],
+            "alias": info["alias"],
+            "grp":   info["grp"],
+            "current_wifi": current or "(未知)",
+            "new_wifi": req.ssid,
+            "status": "preview",
+        }
+
+    executor = _get_shared_executor()
+    results = list(executor.map(_preview, infos))
+    return {"results": results, "preview": True}
 
 
 @app.post("/api/devices/batch/wifi")
@@ -1028,56 +1365,61 @@ def api_batch_wifi(req: BatchWifiReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        results = list(executor.map(lambda item: wifi_task_sync(item, req.ssid, req.pwd), devices))
+    infos = [_device_conn_info(d) for d in devices]
+    executor = _get_shared_executor()
+    results = list(executor.map(lambda info: wifi_task_sync(info, req.ssid, req.pwd), infos))
     return {"results": results}
 
 
-# FIX: requests → httpx
 @app.post("/api/devices/{devid}/sim")
 def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
     device = db.query(Device).filter(Device.id == devid).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     ip   = device.ip
+    _ensure_device_ip_allowed(ip)
     user = (device.user   or DEFAULTUSER).strip()
     pw   = (device.passwd or DEFAULTPASS).strip()
     try:
-        with httpx.Client(timeout=TIMEOUT + 5, follow_redirects=False) as client:
-            resp = client.post(
-                f"http://{ip}/mgr",
-                params={"a": "updatePhnum"},
-                data={"sim1Phnum": req.sim1, "sim2Phnum": req.sim2},
-                auth=httpx.DigestAuth(user, pw),
-            )
+        resp = _get_sync_client().post(
+            f"http://{ip}/mgr",
+            params={"a": "updatePhnum"},
+            data={"sim1Phnum": req.sim1, "sim2Phnum": req.sim2},
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 5,
+        )
         if resp.status_code == 200:
             device.sim1number = req.sim1
             device.sim2number = req.sim2
             db.commit()
             return {"ok": True}
         return {"ok": False, "status": resp.status_code}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("set sim error device=%s: %s", devid, exc, exc_info=True)
         return {"ok": False, "error": "SIM配置失败，请稍后重试"}
 
 
-# FIX: requests → httpx
-def sim_task_sync(device: Device, sim1: str, sim2: str) -> Dict[str, Any]:
-    ip   = device.ip
-    user = (device.user   or DEFAULTUSER).strip()
-    pw   = (device.passwd or DEFAULTPASS).strip()
+def sim_task_sync(device_info: Dict[str, Any], sim1: str, sim2: str) -> Dict[str, Any]:
+    ip   = device_info["ip"]
+    user = device_info["user"]
+    pw   = device_info["pw"]
     try:
-        with httpx.Client(timeout=TIMEOUT + 5, follow_redirects=False) as client:
-            resp = client.post(
-                f"http://{ip}/mgr",
-                params={"a": "updatePhnum"},
-                data={"sim1Phnum": sim1, "sim2Phnum": sim2},
-                auth=httpx.DigestAuth(user, pw),
-            )
-        return {"id": device.id, "ip": ip, "ok": resp.status_code == 200}
+        _ensure_device_ip_allowed(ip)
+        resp = _get_sync_client().post(
+            f"http://{ip}/mgr",
+            params={"a": "updatePhnum"},
+            data={"sim1Phnum": sim1, "sim2Phnum": sim2},
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 5,
+        )
+        return {"id": device_info["id"], "ip": ip, "ok": resp.status_code == 200}
+    except HTTPException as exc:
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
     except Exception as exc:
         logger.warning("sim config %s failed: %s", ip, exc)
-        return {"id": device.id, "ip": ip, "ok": False, "error": "SIM配置失败"}
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "SIM配置失败"}
 
 
 @app.post("/api/devices/batch/sim")
@@ -1085,20 +1427,28 @@ def api_batch_sim(req: BatchSimReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        results = list(executor.map(lambda item: sim_task_sync(item, req.sim1, req.sim2), devices))
+    infos = [_device_conn_info(d) for d in devices]
+    executor = _get_shared_executor()
+    results = list(executor.map(lambda info: sim_task_sync(info, req.sim1, req.sim2), infos))
+    for r in results:
+        if r.get("ok"):
+            dev = db.query(Device).filter(Device.id == r["id"]).first()
+            if dev:
+                dev.sim1number = req.sim1
+                dev.sim2number = req.sim2
+    db.commit()
     return {"results": results}
 
 
-# FIX: requests → httpx
-def enhanced_forward_task_sync(device: Device, req: EnhancedBatchForwardReq) -> Dict[str, Any]:
-    ip   = device.ip
-    user = (device.user   or DEFAULTUSER).strip()
-    pw   = (device.passwd or DEFAULTPASS).strip()
+def enhanced_forward_task_sync(device_info: Dict[str, Any], req: EnhancedBatchForwardReq) -> Dict[str, Any]:
+    ip   = device_info["ip"]
+    user = device_info["user"]
+    pw   = device_info["pw"]
     try:
+        _ensure_device_ip_allowed(ip)
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
-            return {"id": device.id, "ip": ip, "ok": False, "error": "设备认证失败"}
+            return {"id": device_info["id"], "ip": ip, "ok": False, "error": "设备认证失败"}
         form: Dict[str, str] = {"method": req.forward_method}
         method = req.forward_method
         if method == "0":
@@ -1126,12 +1476,18 @@ def enhanced_forward_task_sync(device: Device, req: EnhancedBatchForwardReq) -> 
             form.update(LYWEB_API_URL=req.lyApiUrl)
         else:
             form.update(forwardUrl=req.forwardUrl, notifyUrl=req.notifyUrl)
-        with httpx.Client(timeout=TIMEOUT + 5, follow_redirects=False) as client:
-            resp = client.post(f"http://{ip}/saveForwardConfig", data=form, auth=httpx.DigestAuth(user, pw))
-        return {"id": device.id, "ip": ip, "ok": resp.status_code == 200, "status": resp.status_code}
+        resp = _get_sync_client().post(
+            f"http://{ip}/saveForwardConfig",
+            data=form,
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 5,
+        )
+        return {"id": device_info["id"], "ip": ip, "ok": resp.status_code == 200, "status": resp.status_code}
+    except HTTPException as exc:
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
     except Exception as exc:
         logger.warning("forward config %s failed: %s", ip, exc)
-        return {"id": device.id, "ip": ip, "ok": False, "error": "转发配置失败"}
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "转发配置失败"}
 
 
 @app.post("/api/devices/batch/enhanced-forward")
@@ -1139,8 +1495,9 @@ def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depen
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        results = list(executor.map(lambda item: enhanced_forward_task_sync(item, req), devices))
+    infos = [_device_conn_info(d) for d in devices]
+    executor = _get_shared_executor()
+    results = list(executor.map(lambda info: enhanced_forward_task_sync(info, req), infos))
     return {"results": results}
 
 
@@ -1148,10 +1505,18 @@ def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depen
 def api_batch_forward(req: BatchForwardReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
-    fake = EnhancedBatchForwardReq(device_ids=req.device_ids, forward_method="99", forwardUrl=req.forwardUrl, notifyUrl=req.notifyUrl)
+    # FIX(P1#17): reuse enhanced backend with a named constant instead of the
+    # bare "99" magic string.
+    fake = EnhancedBatchForwardReq(
+        device_ids=req.device_ids,
+        forward_method=FORWARD_METHOD_BASIC,
+        forwardUrl=req.forwardUrl,
+        notifyUrl=req.notifyUrl,
+    )
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        results = list(executor.map(lambda item: enhanced_forward_task_sync(item, fake), devices))
+    infos = [_device_conn_info(d) for d in devices]
+    executor = _get_shared_executor()
+    results = list(executor.map(lambda info: enhanced_forward_task_sync(info, fake), infos))
     return {"results": results}
 
 
@@ -1159,17 +1524,17 @@ def _get_timeout_default() -> int:
     return int(TIMEOUT)
 
 
-# FIX: requests → httpx
 def fetch_device_token(ip: str, user: str, pw: str) -> str:
+    _ensure_device_ip_allowed(ip)
     body = b"keys=%7B%22keys%22%3A%5B%22TOKEN%22%5D%7D"
-    with httpx.Client(timeout=_get_timeout_default() + 5, follow_redirects=False) as client:
-        resp = client.post(
-            f"http://{ip}/mgr",
-            params={"a": "getHtmlData_passwdMgr"},
-            content=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            auth=httpx.DigestAuth(user, pw),
-        )
+    resp = _get_sync_client().post(
+        f"http://{ip}/mgr",
+        params={"a": "getHtmlData_passwdMgr"},
+        content=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        auth=httpx.DigestAuth(user, pw),
+        timeout=_get_timeout_default() + 5,
+    )
     resp.raise_for_status()
     payload = resp.json()
     token = (payload.get("data", {}) or {}).get("TOKEN", "") or ""
@@ -1182,6 +1547,7 @@ def ensure_device_token(db: Session, device: Device) -> str:
         return token
     user = (getattr(device, "user",   "") or DEFAULTUSER).strip()
     pw   = (getattr(device, "passwd", "") or DEFAULTPASS).strip()
+    _ensure_device_ip_allowed(device.ip)
     ok, _ = istargetdevice(device.ip, user, pw)
     if not ok:
         raise HTTPException(status_code=400, detail="Device authentication failed")
@@ -1196,7 +1562,6 @@ def ensure_device_token(db: Session, device: Device) -> str:
     return token
 
 
-# FIX: requests → httpx
 @app.post("/api/tel/dial")
 def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
     if req.slot not in (1, 2):
@@ -1208,6 +1573,7 @@ def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
     device = db.query(Device).filter(Device.id == req.deviceId).first()
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
+    _ensure_device_ip_allowed(device.ip)
     token   = ensure_device_token(db, device)
     timeout = _get_timeout_default()
     params  = {
@@ -1220,8 +1586,7 @@ def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
         "p7": str(int(req.after_action or 0)),
     }
     try:
-        with httpx.Client(timeout=timeout + 8, follow_redirects=False) as client:
-            resp = client.get(f"http://{device.ip}/ctrl", params=params)
+        resp = _get_sync_client().get(f"http://{device.ip}/ctrl", params=params, timeout=timeout + 8)
         try:
             payload = resp.json()
         except Exception:
@@ -1230,6 +1595,141 @@ def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
             _audit("tel_dial", detail=f"device={req.deviceId} slot={req.slot} phone={phone[:4]}***")
             return {"ok": True, "resp": payload}
         return {"ok": False, "error": "设备返回拨号失败"}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("dial error device=%s: %s", req.deviceId, exc, exc_info=True)
         return {"ok": False, "error": "拨号失败，请稍后重试"}
+
+
+# ── OTA 批量升级 ──────────────────────────────────────────────────────────────
+
+class BatchOtaReq(BaseModel):
+    device_ids: List[int]
+
+
+def _ota_check(ip: str, user: str, pw: str) -> Dict[str, Any]:
+    """Raw OTA version check used by both `check` and `upgrade` flows."""
+    _ensure_device_ip_allowed(ip)
+    resp = _get_sync_client().get(
+        f"http://{ip}/ota",
+        params={"a": "chkNewVer"},
+        auth=httpx.DigestAuth(user, pw),
+        timeout=TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    return data if isinstance(data, dict) else {}
+
+
+# FIX(N3+N4): each worker opens its own Session (SQLAlchemy Session is not
+# thread-safe); store the reported version in firmware_version instead of
+# overwriting the device's stable identifier devId.
+def check_ota_task(device_id: int) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            return {"id": device_id, "ok": False, "error": "设备不存在"}
+        ip   = device.ip
+        user = (device.user   or DEFAULTUSER).strip()
+        pw   = (device.passwd or DEFAULTPASS).strip()
+        try:
+            data = _ota_check(ip, user, pw)
+        except HTTPException as exc:
+            return {"id": device.id, "ip": ip, "ok": False, "error": exc.detail}
+        except Exception as exc:
+            return {"id": device.id, "ip": ip, "ok": False, "error": str(exc)}
+        cur_ver = str(data.get("curVer", "") or "")
+        new_ver = str(data.get("newVer", "") or "")
+        if cur_ver:
+            device.firmware_version = cur_ver
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+        return {
+            "id":         device.id,
+            "ip":         ip,
+            "ok":         True,
+            "hasUpdate":  bool(data.get("hasUpdate", False)) or (bool(new_ver) and new_ver != cur_ver),
+            "currentVer": cur_ver,
+            "newVer":     new_ver,
+        }
+    finally:
+        db.close()
+
+
+# FIX(N6): only call chkNewVer once per device. If the caller already has the
+# newVer from a prior check, the check phase here can be used directly for the
+# decision. We intentionally do not re-query if the cached device row already
+# has a known firmware_version and the caller didn't force a recheck.
+def upgrade_ota_task(device_id: int) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            return {"id": device_id, "ok": False, "error": "设备不存在"}
+        ip   = device.ip
+        user = (device.user   or DEFAULTUSER).strip()
+        pw   = (device.passwd or DEFAULTPASS).strip()
+        try:
+            data    = _ota_check(ip, user, pw)
+            cur_ver = str(data.get("curVer", "") or "")
+            new_ver = str(data.get("newVer", "") or "")
+            if cur_ver:
+                device.firmware_version = cur_ver
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            if not new_ver or new_ver == cur_ver:
+                return {"id": device.id, "ip": ip, "ok": False, "error": "已是最新版本"}
+            upgrade_resp = _get_sync_client().get(
+                f"http://{ip}/ota",
+                params={"a": "updOtaOnline"},
+                auth=httpx.DigestAuth(user, pw),
+                timeout=TIMEOUT,
+            )
+            return {
+                "id":     device.id,
+                "ip":     ip,
+                "ok":     upgrade_resp.status_code == 200,
+                "newVer": new_ver,
+            }
+        except HTTPException as exc:
+            return {"id": device.id, "ip": ip, "ok": False, "error": exc.detail}
+        except Exception as exc:
+            return {"id": device.id, "ip": ip, "ok": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+def _check_ota_batch_allowed(request: Request, device_ids: List[int]) -> None:
+    if not device_ids:
+        raise HTTPException(status_code=400, detail="device_ids required")
+    if len(device_ids) > OTA_BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"单次 OTA 批量不得超过 {OTA_BATCH_MAX} 台")
+    # FIX(N5): per-caller rate limit so OTA can't be weaponised as a reboot storm.
+    key = f"ota:{_client_ip(request)}"
+    if not _ota_limiter.allow(key):
+        raise HTTPException(status_code=429, detail="OTA 操作过于频繁，请稍后再试")
+
+
+@app.post("/api/devices/batch/ota/check")
+def api_batch_ota_check(req: BatchOtaReq, request: Request, db: Session = Depends(get_db)):
+    _check_ota_batch_allowed(request, req.device_ids)
+    existing_ids = [row.id for row in db.query(Device.id).filter(Device.id.in_(req.device_ids)).all()]
+    executor = _get_shared_executor()
+    results = list(executor.map(check_ota_task, existing_ids))
+    return {"results": results}
+
+
+@app.post("/api/devices/batch/ota/upgrade")
+def api_batch_ota_upgrade(req: BatchOtaReq, request: Request, db: Session = Depends(get_db)):
+    _check_ota_batch_allowed(request, req.device_ids)
+    existing_ids = [row.id for row in db.query(Device.id).filter(Device.id.in_(req.device_ids)).all()]
+    executor = _get_shared_executor()
+    results = list(executor.map(upgrade_ota_task, existing_ids))
+    _audit("ota_upgrade", detail=f"count={len(existing_ids)} ips={[r.get('ip') for r in results]}")
+    return {"results": results}
