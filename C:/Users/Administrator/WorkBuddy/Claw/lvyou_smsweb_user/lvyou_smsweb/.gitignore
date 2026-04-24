@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Frontend build
+frontend/dist/
+dist/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Environment / local config
+.env
+.env.*
+*.local
+
+# Runtime / deployed files
+/opt/
+/etc/board-manager.conf
+
+# Project temp / backup
+*.bak
+*.tmp
+*.swp
+*~
+/tmp/
+
+# Database / local data
+data.db
+*.sqlite
+*.sqlite3
+/opt/board-manager/
+/var/backups/board-manager/
+
+# Coverage / cache
+.coverage
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Build leftovers
+frontend/.vite/
