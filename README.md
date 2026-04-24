@@ -147,6 +147,11 @@ docker compose up -d
 | `BMLOGINRATELIMIT` | 5 | 登录尝试频率限制（次/分钟） |
 | `BMSMSMAXLEN` | 500 | 短信内容最大长度 |
 | `BMALLOWORIGINS` | 空 | CORS 允许的域名，逗号分隔 |
+| `BMOTARATELIMIT` | 4 | OTA 批量操作频率限制（次/分钟） |
+| `BMOTARATEPERIOD` | 60 | OTA 限流窗口（秒） |
+| `BMOTABATCHMAX` | 64 | OTA 批量操作设备数上限 |
+| `BMPREWARMCONCURRENCY` | 64 | 扫描阶段并发 ping 上限 |
+| `BMTRUSTEDPROXYHOPS` | 0 | 信任的反代层数（≥1时用X-Forwarded-For） |
 
 #### 本地构建镜像
 
@@ -273,30 +278,51 @@ cat /etc/board-manager.conf
 
 ## 版本更新 v5.0
 
-### 安全性增强
-- **登录频率限制**：防止暴力破解，默认5次/分钟
-- **请求频率控制**：短信发送和电话拨号频率限制
-- **审计日志**：记录关键操作（登录、扫描、短信、拨号）
-- **强化验证**：手机号格式验证、短信内容长度限制
+v5.0 是一次重大安全与性能升级，包含 20+ 项修复和优化。
 
-### 性能优化
-- **HTTP客户端升级**：从 `requests` 迁移到 `httpx`，支持异步和连接池
-- **异步扫描任务**：扫描改为后台任务，支持实时状态查询
-- **连接池管理**：优化HTTP连接复用，减少资源消耗
-- **并发配置优化**：提高扫描和探测的并发数
+### 🔐 安全性增强 (Critical)
+- **Docker HEALTHCHECK 修复**：`/api/health` 加入公开路径，解决 401 错误
+- **会话共享修复**：新增 `auth_tokens` 表，v4/v6 双栈进程共享登录状态
+- **SSRF 防护**：新增 IP 白名单校验，防止内网跳板攻击
+- **Shell 注入修复**：所有命令执行改为 argv 传参，消除注入风险
+- **CORS 安全强化**：`*` + `allow_credentials` 组合强制报错，防止 CSRF
+- **登录限流增强**：支持 `X-Forwarded-For` 真实 IP 识别（`BMTRUSTEDPROXYHOPS`）
+- **OTA 限流保护**：新增批量 OTA 频率限制（默认 4次/60秒/IP）和数量上限（64台）
 
-### 功能完善
-- **扫描状态查询**：新增 `/api/scan/status/{scan_id}` 接口
-- **增强错误处理**：统一的异常处理机制和错误ID追踪
-- **数据验证强化**：使用 Pydantic 模型进行输入验证
-- **凭据安全**：扫描凭据通过 POST Body 传递，避免URL暴露
+### ⚡ 性能优化
+- **HTTP 客户端升级**：从 `requests` 迁移到 `httpx`，支持异步和连接池
+- **全局连接池**：单例 `_sync_client` 复用 HTTP 连接，减少 TLS 握手开销
+- **线程池复用**：全局 `_shared_executor` 替代频繁创建销毁
+- **扫描性能优化**：`prewarm_neighbors` 引入并发控制（`BMPREWARMCONCURRENCY`，默认64）
+- **设备列表优化**：恢复纯 DB 读取，解决 50 秒卡顿问题
 
-### 环境变量新增
-- `BMSMSRATELIMIT` - 短信发送频率限制
-- `BMDIALRATELIMIT` - 电话拨号频率限制
-- `BMLOGINRATELIMIT` - 登录尝试频率限制
-- `BMSCANTTL` - 扫描结果存活时间
-- `BMSMSMAXLEN` - 短信内容最大长度
+### 🗄️ 数据库与架构
+- **自动迁移**：幂等 ALTER TABLE，兼容老库升级（新增 `sim1signal/sim2signal/firmware_version/token` 列）
+- **线程安全**：`ScanState` 全部操作加锁，新增 `set_status/set_progress` 等方法
+- **Session 安全**：批量任务每个 worker 独立 `SessionLocal()`
+- **设备标识修复**：OTA 检查不再覆盖 `devId`，新增独立 `firmware_version` 列
+
+### ✨ 新增功能
+- **信号强度显示**：设备卡片显示 SIM1/SIM2 信号百分比
+- **命令行工具**：`scripts/lvyou` 支持 `pass/port/unit` 管理
+- **WiFi 预览真实化**：真正并发调用设备获取当前 SSID
+- **配置原子写入**：`lvyou pass` 改用 awk 重写，支持特殊字符密码
+- **反代支持**：`BMTRUSTEDPROXYHOPS` 配置信任代理层数
+
+### 🔧 可靠性修复
+- **异常处理**：`HTTPException` 不再被全局处理器吞掉
+- **设备更新安全**：`upsertdevice` 改为软删除，避免误删其他设备
+- **扫描任务清理**：自动清理超期已完成任务，防止内存泄漏
+- **配置原子性**：所有配置修改先备份再原子替换
+
+### 📋 环境变量新增
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `BMOTARATELIMIT` | 4 | OTA 限流次数 |
+| `BMOTARATEPERIOD` | 60 | OTA 限流窗口（秒） |
+| `BMOTABATCHMAX` | 64 | OTA 批量上限 |
+| `BMPREWARMCONCURRENCY` | 64 | 扫描并发 ping 上限 |
+| `BMTRUSTEDPROXYHOPS` | 0 | 信任代理层数 |
 
 ## 技术栈
 
