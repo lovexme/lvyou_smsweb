@@ -33,6 +33,7 @@ const selectAll = ref(false)
 const showWifiModal = ref(false)
 const showDetailModal = ref(false)
 const showOtaModal = ref(false)
+const showConfigModal = ref(false)
 
 const wifiSsid = ref('')
 const wifiPwd = ref('')
@@ -42,6 +43,15 @@ const wifiPreviewResults = ref([]) // WiFi配置预览结果
 // OTA相关变量
 const otaResults = ref([])
 const otaUpgrading = ref(false)
+
+const configStep = ref('read')
+const configData = ref([])
+const configPattern = ref('')
+const configReplacement = ref('')
+const configFlags = ref('s')
+const configPreviewData = ref([])
+const configExpandedIds = ref([])
+const configMode = ref('regex')
 
 const scanCidr = ref('')
 const scanUser = ref('admin')
@@ -500,6 +510,156 @@ async function upgradeOta() {
   }
 }
 
+function openConfigModal() {
+  if (!selectedCount.value) {
+    setNotice('请先勾选设备', 'err')
+    return
+  }
+  configStep.value = 'read'
+  configData.value = []
+  configPattern.value = ''
+  configReplacement.value = ''
+  configFlags.value = 's'
+  configPreviewData.value = []
+  configExpandedIds.value = []
+  configMode.value = 'regex'
+  showConfigModal.value = true
+}
+
+function closeConfigModal() {
+  showConfigModal.value = false
+  configData.value = []
+  configPreviewData.value = []
+  configExpandedIds.value = []
+}
+
+async function readConfigs() {
+  if (!selectedCount.value) {
+    setNotice('请先勾选设备', 'err')
+    return
+  }
+  loading.value = true
+  try {
+    const resp = await api.post('/api/devices/batch/config/read', {
+      device_ids: selectedIds.value
+    })
+    configData.value = resp.data && resp.data.configs ? resp.data.configs : []
+    configStep.value = 'edit'
+    const firstOk = configData.value.find(item => item.ok)
+    configExpandedIds.value = firstOk ? [firstOk.id] : []
+    setNotice(`读取完成：${configData.value.filter(item => item.ok).length}/${configData.value.length}`, 'info')
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '读取配置失败', 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+function toggleConfigExpand(id) {
+  const idx = configExpandedIds.value.indexOf(id)
+  if (idx > -1) {
+    configExpandedIds.value.splice(idx, 1)
+  } else {
+    configExpandedIds.value.push(id)
+  }
+}
+
+async function previewConfig() {
+  if (!configPattern.value.trim()) {
+    setNotice('请输入正则表达式', 'err')
+    return
+  }
+  loading.value = true
+  try {
+    const resp = await api.post('/api/devices/batch/config/preview', {
+      device_ids: selectedIds.value,
+      pattern: configPattern.value,
+      replacement: configReplacement.value,
+      flags: configFlags.value
+    })
+    configPreviewData.value = resp.data && resp.data.previews ? resp.data.previews : []
+    configStep.value = 'preview'
+    const firstChanged = configPreviewData.value.find(item => item.ok && item.changed)
+    const firstResult = firstChanged || configPreviewData.value[0]
+    configExpandedIds.value = firstResult ? [firstResult.id] : []
+    setNotice(`预览完成：${configPreviewData.value.filter(item => item.ok && item.changed).length} 台有变更`, 'info')
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '预览失败', 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function previewCleanMessageTemplates() {
+  loading.value = true
+  try {
+    const resp = await api.post('/api/devices/batch/config/preset/preview', {
+      device_ids: selectedIds.value,
+      preset: 'clean_message_templates'
+    })
+    configPreviewData.value = resp.data && resp.data.previews ? resp.data.previews : []
+    configStep.value = 'preview'
+    configMode.value = 'clean_message_templates'
+    const firstChanged = configPreviewData.value.find(item => item.ok && item.changed)
+    const firstResult = firstChanged || configPreviewData.value[0]
+    configExpandedIds.value = firstResult ? [firstResult.id] : []
+    setNotice(`简洁模板预览完成：${configPreviewData.value.filter(item => item.ok && item.changed).length} 台有变更`, 'info')
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '预览失败', 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function writeConfigs() {
+  const changedCount = configPreviewData.value.filter(item => item.ok && item.changed).length
+  if (!changedCount) {
+    setNotice('预览没有发现可写入的变更', 'warn')
+    return
+  }
+  const modeText = configMode.value === 'clean_message_templates' ? '应用简洁消息模板' : '按正则替换'
+  if (!confirm(`确认对 ${changedCount} 台设备写入配置？\n本次操作：${modeText}。\n会先重新读取每台设备当前配置，写入后再读回校验。`)) return
+  loading.value = true
+  try {
+    const payload = { device_ids: selectedIds.value }
+    const resp = configMode.value === 'clean_message_templates'
+      ? await api.post('/api/devices/batch/config/preset/write', { ...payload, preset: 'clean_message_templates' })
+      : await api.post('/api/devices/batch/config/write', {
+        ...payload,
+        pattern: configPattern.value,
+        replacement: configReplacement.value,
+        flags: configFlags.value
+      })
+    const results = resp.data && resp.data.results ? resp.data.results : []
+    const okCount = results.filter(item => item.ok).length
+    const changed = results.filter(item => item.changed).length
+    setNotice(`配置写入完成：${okCount}/${results.length} 成功，${changed} 台有变更`, okCount ? 'ok' : 'err')
+    closeConfigModal()
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '写入失败', 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+function diffLines(original, replaced) {
+  const oLines = (original || '').split('\n')
+  const rLines = (replaced || '').split('\n')
+  const maxLen = Math.max(oLines.length, rLines.length)
+  const lines = []
+  for (let i = 0; i < maxLen; i++) {
+    const o = oLines[i] !== undefined ? oLines[i] : ''
+    const r = rLines[i] !== undefined ? rLines[i] : ''
+    if (o === r) {
+      lines.push({ type: 'same', text: o })
+    } else {
+      if (o) lines.push({ type: 'del', text: o })
+      if (r) lines.push({ type: 'add', text: r })
+    }
+  }
+  return lines
+}
+
 async function previewWifi() {
   if (!wifiSsid.value.trim()) {
     setNotice('请输入SSID', 'err')
@@ -691,6 +851,84 @@ function wifiDbmLabel(dbm) {
         <button class="notice-close" @click="clearNotice">×</button>
       </div>
 
+      <div v-if="showConfigModal" class="modal-overlay" @click.self="closeConfigModal">
+        <div class="modal modal-xl">
+          <div class="modal-header">
+            <h3>批量设备配置</h3>
+            <button class="modal-close" @click="closeConfigModal">×</button>
+          </div>
+          <div class="modal-body">
+            <div v-if="configStep === 'read'" class="config-intro">
+              <p class="config-info">先读取 {{ selectedCount }} 台设备当前配置，再用正则只替换匹配到的片段，避免覆盖每台设备不同的数据。</p>
+              <button class="btn-confirm full-width" @click="readConfigs" :disabled="loading">
+                {{ loading ? '读取中...' : '读取配置' }}
+              </button>
+            </div>
+
+            <div v-if="configStep === 'edit'" class="config-flow">
+              <div class="config-devices-list">
+                <div v-for="c in configData" :key="c.id" class="config-device-item">
+                  <div class="config-device-header" @click="toggleConfigExpand(c.id)">
+                    <span class="mono">{{ c.ip }}</span>
+                    <span :class="['config-status', c.ok ? 'ok' : 'err']">{{ c.ok ? '已读取' : '失败' }}</span>
+                    <span class="config-expand-icon">{{ configExpandedIds.includes(c.id) ? '▼' : '▶' }}</span>
+                  </div>
+                  <div v-if="configExpandedIds.includes(c.id)" class="config-content">
+                    <pre v-if="c.ok" class="config-pre">{{ c.config }}</pre>
+                    <span v-else class="config-error">{{ c.error }}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="config-regex-section">
+                <p class="config-section-title">小白模式</p>
+                <p class="config-hint">自动保留前面的主 JSON 配置，只替换后面的消息模板区，避免把设备配置改坏。</p>
+                <button class="btn-confirm full-width" @click="previewCleanMessageTemplates" :disabled="loading">
+                  应用简洁消息模板（推荐）
+                </button>
+              </div>
+              <div class="config-regex-section">
+                <p class="config-section-title">正则替换规则</p>
+                <textarea v-model="configPattern" class="form-textarea-full" rows="4" placeholder="正则表达式，例如：(?s)&quot;uip&quot;:\\s*\\[.*?\\]\\s*(?=,\\s*&quot;sysArgs&quot;)"></textarea>
+                <textarea v-model="configReplacement" class="form-textarea-full" rows="5" placeholder="替换文本：只填写要替换进去的片段"></textarea>
+                <input v-model="configFlags" class="form-input" placeholder="标志位：i 忽略大小写，m 多行，s 点号匹配换行" />
+                <p class="config-hint">不要把开头主 JSON 替换成 {}。建议只匹配消息模板区或 uip 固定片段，先预览确认主 JSON 还完整。</p>
+                <div class="config-btn-row">
+                  <button class="btn-cancel" @click="configStep = 'read'">上一步</button>
+                  <button class="btn-confirm" @click="previewConfig" :disabled="loading || !configPattern.trim()">预览替换</button>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="configStep === 'preview'" class="config-flow">
+              <div class="config-devices-list">
+                <div v-for="p in configPreviewData" :key="p.id" class="config-device-item">
+                  <div class="config-device-header" @click="toggleConfigExpand(p.id)">
+                    <span class="mono">{{ p.ip }}</span>
+                    <span v-if="configMode === 'clean_message_templates'" class="config-status info">简洁模板</span>
+                    <span v-if="p.ok" :class="['config-status', p.changed ? 'warn' : 'ok']">{{ p.changed ? '有变更' : '无变更' }}</span>
+                    <span v-else class="config-status err">错误</span>
+                    <span class="config-expand-icon">{{ configExpandedIds.includes(p.id) ? '▼' : '▶' }}</span>
+                  </div>
+                  <div v-if="configExpandedIds.includes(p.id)" class="config-content">
+                    <div v-if="p.ok && p.changed" class="config-diff">
+                      <div v-for="(line, idx) in diffLines(p.original, p.replaced)" :key="idx" :class="['diff-line', 'diff-' + line.type]">
+                        <span class="diff-prefix">{{ line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' ' }}</span>{{ line.text }}
+                      </div>
+                    </div>
+                    <pre v-else-if="p.ok" class="config-pre">{{ p.original }}</pre>
+                    <span v-else class="config-error">{{ p.error }}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="config-btn-row">
+                <button class="btn-cancel" @click="configStep = 'edit'">返回修改</button>
+                <button class="btn-confirm danger-btn" @click="writeConfigs" :disabled="loading || !configPreviewData.filter(item => item.ok && item.changed).length">确认写入</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="stats-grid">
         <div class="stat-card online">
           <div class="stat-icon" aria-hidden="true"><span class="stat-dot stat-dot-online"></span></div>
@@ -779,6 +1017,7 @@ function wifiDbmLabel(dbm) {
         <div class="toolbar-right">
           <button class="toolbar-btn" @click="openWifiModal" :disabled="selectedCount === 0">WiFi</button>
           <button class="toolbar-btn" @click="openOtaModal" :disabled="selectedCount === 0">OTA</button>
+          <button class="toolbar-btn" @click="openConfigModal" :disabled="selectedCount === 0">配置</button>
           <button class="toolbar-btn danger" @click="batchDeleteSelected" :disabled="selectedCount === 0">删除</button>
         </div>
       </div>
@@ -1205,22 +1444,52 @@ body {
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
 .modal { background: var(--bg-card); border-radius: 16px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
 .modal-lg { max-width: 560px; }
+.modal-xl { max-width: 820px; }
 .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--border); }
 .modal-header h3 { font-size: 17px; font-weight: 600; }
 .modal-close { background: none; border: none; color: var(--text-secondary); font-size: 24px; cursor: pointer; }
 .modal-body { padding: 20px; display: flex; flex-direction: column; gap: 10px; }
 .modal-footer { display: flex; gap: 12px; padding: 16px 20px; border-top: 1px solid var(--border); }
 
-.form-input, .form-select-full { width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 11px 14px; color: var(--text-primary); font-size: 14px; outline: none; }
-.form-input:focus, .form-select-full:focus { border-color: var(--primary); }
+.form-input, .form-select-full, .form-textarea-full { width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 11px 14px; color: var(--text-primary); font-size: 14px; outline: none; }
+.form-input:focus, .form-select-full:focus, .form-textarea-full:focus { border-color: var(--primary); }
+.form-textarea-full { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.45; }
 .form-group { display: flex; flex-direction: column; gap: 6px; }
 .form-label { font-size: 13px; color: var(--text-secondary); }
 .config-section { display: flex; flex-direction: column; gap: 8px; }
+.config-intro, .config-flow { display: flex; flex-direction: column; gap: 12px; }
+.config-info, .config-hint { color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.config-hint { margin-top: -2px; }
+.config-devices-list { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; }
+.config-device-item { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg-dark); }
+.config-device-header { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 10px 12px; cursor: pointer; }
+.config-content { border-top: 1px solid var(--border); padding: 10px; overflow-x: auto; }
+.config-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45; color: var(--text-secondary); }
+.config-error { color: var(--danger); font-size: 13px; }
+.config-status { font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+.config-status.ok { background: rgba(16,185,129,0.2); color: var(--success); }
+.config-status.warn { background: rgba(245,158,11,0.2); color: var(--warning); }
+.config-status.err { background: rgba(239,68,68,0.2); color: var(--danger); }
+.config-status.info { background: rgba(59,130,246,0.2); color: var(--primary); }
+.config-expand-icon { color: var(--text-secondary); font-size: 12px; }
+.config-regex-section { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 12px; }
+.config-section-title { font-weight: 600; font-size: 14px; }
+.config-btn-row { display: flex; gap: 10px; }
+.config-btn-row .btn-cancel, .config-btn-row .btn-confirm { flex: 1; }
+.config-diff { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.diff-line { padding: 1px 4px; }
+.diff-add { background: rgba(16,185,129,0.14); color: var(--success); }
+.diff-del { background: rgba(239,68,68,0.14); color: var(--danger); }
+.diff-same { color: var(--text-secondary); }
+.diff-prefix { display: inline-block; width: 18px; color: var(--text-secondary); }
+.full-width { width: 100%; }
 
 .btn-cancel { flex: 1; background: var(--bg-dark); border: 1px solid var(--border); color: var(--text-primary); padding: 11px; border-radius: 8px; cursor: pointer; }
 .btn-confirm { flex: 1; background: var(--primary); border: none; color: white; padding: 11px; border-radius: 8px; cursor: pointer; font-weight: 500; }
 .btn-confirm:hover:not(:disabled) { background: var(--primary-dark); }
 .btn-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+.danger-btn { background: var(--danger); }
+.danger-btn:hover:not(:disabled) { background: #dc2626; }
 .btn-preview { flex: 1; background: var(--bg-card-hover); border: 1px solid var(--border); color: var(--text-primary); padding: 11px; border-radius: 8px; cursor: pointer; font-weight: 500; }
 .btn-preview:hover:not(:disabled) { background: var(--border); }
 .btn-preview:disabled { opacity: 0.5; cursor: not-allowed; }
