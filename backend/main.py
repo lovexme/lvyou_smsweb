@@ -23,6 +23,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, BigInteger,
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+from backend import cloud139, notify
+
 import concurrent.futures
 import hmac
 import logging
@@ -98,6 +100,35 @@ class AuthToken(Base):
     token    = Column(String(128), primary_key=True)
     username = Column(String(64),  default="")
     exp      = Column(BigInteger,  default=0, index=True)
+
+
+class Cloud139Account(Base):
+    """Stored cloud.139.com keep-alive accounts.
+
+    Only the JWT and a user-provided label are persisted; the JWT's exp /
+    account-hash claims are decoded on read. Each row represents one cloud
+    phone session that the daily keep-alive task should ping.
+    """
+    __tablename__ = "cloud139_accounts"
+    id          = Column(Integer, primary_key=True, index=True)
+    label       = Column(String(64),  default="")
+    token       = Column(Text,        default="", nullable=False)
+    created_at  = Column(BigInteger,  default=0)
+    last_check_at  = Column(BigInteger, default=0)
+    last_check_ok  = Column(Integer,    default=0)
+    last_check_msg = Column(String(255), default="")
+    notify_failed_at = Column(BigInteger, default=0)
+
+
+class AppSetting(Base):
+    """Tiny key/value store for admin-managed runtime settings.
+
+    Used by the cloud139 keep-alive feature to hold WeChat Work credentials
+    and the polling interval. Values are JSON-encoded strings.
+    """
+    __tablename__ = "app_settings"
+    key   = Column(String(64),  primary_key=True)
+    value = Column(Text,        default="")
 
 
 Base.metadata.create_all(bind=engine)
@@ -409,6 +440,134 @@ async def _scan_cleanup_loop() -> None:
         await asyncio.sleep(60)
 
 
+# ── cloud.139.com keep-alive ──────────────────────────────────────────────
+# Re-pinging every CLOUD139_INTERVAL_SECONDS keeps the server-side session
+# from going idle. Default: every 6 hours.
+CLOUD139_INTERVAL_DEFAULT = int(os.environ.get("BMCLOUD139INTERVAL", str(6 * 3600)))
+# Idle interval when the loop has nothing to do (no accounts configured).
+CLOUD139_IDLE_SLEEP = 300
+
+
+def _get_setting(db: Session, key: str, default: Any = None) -> Any:
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    if not row or not row.value:
+        return default
+    try:
+        return json.loads(row.value)
+    except Exception:
+        return default
+
+
+def _set_setting(db: Session, key: str, value: Any) -> None:
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    payload = json.dumps(value, ensure_ascii=False)
+    if row:
+        row.value = payload
+    else:
+        db.add(AppSetting(key=key, value=payload))
+    db.commit()
+
+
+def _cloud139_interval(db: Session) -> int:
+    raw = _get_setting(db, "cloud139_interval", CLOUD139_INTERVAL_DEFAULT)
+    try:
+        sec = int(raw)
+    except Exception:
+        sec = CLOUD139_INTERVAL_DEFAULT
+    return max(300, sec)
+
+
+def _cloud139_run_once(db: Session) -> Dict[str, Any]:
+    """Ping checkToken for every stored account that's due. Notifies admin
+    via WeChat Work on the first failure of an account (de-bounced via
+    notify_failed_at). Returns a small summary for the manual-trigger API.
+    """
+    interval = _cloud139_interval(db)
+    cutoff_ms = int(time.time() * 1000) - interval * 1000
+    rows = db.query(Cloud139Account).all()
+    summary: List[Dict[str, Any]] = []
+    notify_cfg = _get_setting(db, "wxwork", {}) or {}
+    wx = notify.WxWorkConfig(
+        corpid=str(notify_cfg.get("corpid") or "").strip(),
+        corpsecret=str(notify_cfg.get("corpsecret") or "").strip(),
+        agentid=str(notify_cfg.get("agentid") or "").strip(),
+        touser=str(notify_cfg.get("touser") or "@all").strip() or "@all",
+    )
+    client = _get_sync_client()
+    for row in rows:
+        # Skip rows that were checked recently (force_all bypass not needed
+        # here; manual trigger calls _cloud139_check_one directly).
+        if row.last_check_at and row.last_check_at > cutoff_ms:
+            continue
+        result = cloud139.check_token(client, row.token or "")
+        now_ms = int(time.time() * 1000)
+        row.last_check_at = now_ms
+        row.last_check_ok = 1 if result.ok else 0
+        row.last_check_msg = (result.err_msg or result.err_code or "")[:255]
+        if result.ok:
+            row.notify_failed_at = 0
+        else:
+            # De-bounce: only notify once per failure window (interval).
+            last_notify = row.notify_failed_at or 0
+            if now_ms - last_notify > interval * 1000:
+                label = row.label or f"#{row.id}"
+                msg = (
+                    f"【云手机保活失败】{label}\n"
+                    f"状态: HTTP {result.status} / {result.err_code} / {result.err_msg}\n"
+                    "请前往 lvyou-smsweb 控制台重新登录 cloud.139.com 并粘贴新的 token。"
+                )
+                if wx.corpid and wx.corpsecret and wx.agentid:
+                    ok, err = notify.send_wxwork_text(client, wx, msg)
+                    if ok:
+                        row.notify_failed_at = now_ms
+                    else:
+                        logger.warning("wxwork notify failed: %s", err)
+                else:
+                    logger.warning("cloud139 keepalive failed but WxWork not configured: %s", msg)
+        summary.append({
+            "id": row.id,
+            "label": row.label,
+            "ok": result.ok,
+            "code": result.err_code,
+            "message": result.err_msg,
+        })
+    db.commit()
+    return {"checked": len(summary), "results": summary}
+
+
+def _cloud139_check_one(db: Session, account: "Cloud139Account") -> Dict[str, Any]:
+    client = _get_sync_client()
+    result = cloud139.check_token(client, account.token or "")
+    now_ms = int(time.time() * 1000)
+    account.last_check_at = now_ms
+    account.last_check_ok = 1 if result.ok else 0
+    account.last_check_msg = (result.err_msg or result.err_code or "")[:255]
+    if result.ok:
+        account.notify_failed_at = 0
+    db.commit()
+    return result.to_dict()
+
+
+async def _cloud139_keepalive_loop() -> None:
+    """Periodically run the keep-alive check. Uses its own short DB session."""
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                count = db.query(Cloud139Account).count()
+                if count == 0:
+                    sleep_for = CLOUD139_IDLE_SLEEP
+                else:
+                    _cloud139_run_once(db)
+                    sleep_for = max(60, _cloud139_interval(db) // 4)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("cloud139 keepalive loop error")
+            sleep_for = CLOUD139_IDLE_SLEEP
+        await asyncio.sleep(sleep_for)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _sync_client, _shared_executor, _cleanup_task
@@ -429,6 +588,7 @@ async def lifespan(app: FastAPI):
     app.state.executor = _shared_executor
     # FIX(P1#12): periodic cleanup task for finished scan tasks and expired tokens.
     _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+    _cloud139_task = asyncio.create_task(_cloud139_keepalive_loop())
     try:
         yield
     finally:
@@ -438,6 +598,11 @@ async def lifespan(app: FastAPI):
                 await _cleanup_task
             except (asyncio.CancelledError, Exception):
                 pass
+        _cloud139_task.cancel()
+        try:
+            await _cloud139_task
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             await app.state.http_client.aclose()
         except Exception:
@@ -2113,3 +2278,189 @@ def api_batch_ota_upgrade(req: BatchOtaReq, request: Request, db: Session = Depe
     results = list(executor.map(upgrade_ota_task, existing_ids))
     _audit("ota_upgrade", detail=f"count={len(existing_ids)} ips={[r.get('ip') for r in results]}")
     return {"results": results}
+
+
+# ── cloud.139.com keep-alive APIs ────────────────────────────────────────
+class Cloud139TokenReq(BaseModel):
+    token: str
+    label: str = ""
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, v: str) -> str:
+        v = (v or "").strip()
+        # Strip optional "Bearer " prefix some users will paste accidentally.
+        if v.lower().startswith("bearer "):
+            v = v[7:].strip()
+        if not v or len(v) < 20 or v.count(".") < 2:
+            raise ValueError("token 看起来不是 JWT")
+        if len(v) > 4000:
+            raise ValueError("token 过长")
+        return v
+
+
+class WxWorkConfigReq(BaseModel):
+    corpid:     str = ""
+    corpsecret: str = ""
+    agentid:    str = ""
+    touser:     str = "@all"
+
+
+class Cloud139IntervalReq(BaseModel):
+    interval_seconds: int
+
+
+def _account_to_dict(row: Cloud139Account) -> Dict[str, Any]:
+    summary = cloud139.jwt_account_summary(row.token or "")
+    return {
+        "id": row.id,
+        "label": row.label or "",
+        "account_hash": summary["account_hash"],
+        "sub_id": summary["sub_id"],
+        "exp": summary["exp"],
+        "login_method": summary["login_method"],
+        "client_type": summary["client_type"],
+        "created_at": int(row.created_at or 0),
+        "last_check_at": int(row.last_check_at or 0),
+        "last_check_ok": bool(row.last_check_ok),
+        "last_check_msg": row.last_check_msg or "",
+    }
+
+
+@app.get("/api/cloud139/accounts")
+def api_cloud139_list(db: Session = Depends(get_db)):
+    rows = db.query(Cloud139Account).order_by(Cloud139Account.id.asc()).all()
+    return {
+        "accounts": [_account_to_dict(r) for r in rows],
+        "interval_seconds": _cloud139_interval(db),
+    }
+
+
+@app.post("/api/cloud139/accounts")
+def api_cloud139_upsert(req: Cloud139TokenReq, db: Session = Depends(get_db)):
+    payload = cloud139.decode_jwt_payload(req.token)
+    account_hash = str(payload.get("account") or "")[:64]
+    # Upsert by account hash so replacing an expired token for the same user
+    # keeps history continuity (last_check_*).
+    row: Optional[Cloud139Account] = None
+    if account_hash:
+        for cand in db.query(Cloud139Account).all():
+            cand_hash = str(cloud139.decode_jwt_payload(cand.token or "").get("account") or "")[:64]
+            if cand_hash == account_hash:
+                row = cand
+                break
+    if not row:
+        row = Cloud139Account(created_at=int(time.time() * 1000))
+        db.add(row)
+    row.token = req.token
+    if req.label:
+        row.label = req.label[:64]
+    elif not row.label:
+        row.label = (payload.get("subId") or payload.get("sub") or "")[:32] or "account"
+    # Reset failure de-bounce so the next check writes fresh status.
+    row.notify_failed_at = 0
+    db.flush()
+    # Run an immediate check so the user sees status without waiting for the loop.
+    immediate = _cloud139_check_one(db, row)
+    db.commit()
+    _audit("cloud139_token_upsert", detail=f"id={row.id} label={row.label} account_hash={account_hash[:8]}")
+    return {"account": _account_to_dict(row), "check": immediate}
+
+
+@app.delete("/api/cloud139/accounts/{account_id}")
+def api_cloud139_delete(account_id: int, db: Session = Depends(get_db)):
+    row = db.query(Cloud139Account).filter(Cloud139Account.id == account_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    db.delete(row)
+    db.commit()
+    _audit("cloud139_token_delete", detail=f"id={account_id}")
+    return {"ok": True}
+
+
+@app.post("/api/cloud139/accounts/{account_id}/check")
+def api_cloud139_check_one(account_id: int, db: Session = Depends(get_db)):
+    row = db.query(Cloud139Account).filter(Cloud139Account.id == account_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    result = _cloud139_check_one(db, row)
+    return {"account": _account_to_dict(row), "check": result}
+
+
+@app.post("/api/cloud139/run")
+def api_cloud139_run_now(db: Session = Depends(get_db)):
+    """Force a keep-alive sweep across all accounts (ignoring interval cutoff)."""
+    rows = db.query(Cloud139Account).all()
+    summary = []
+    for row in rows:
+        result = _cloud139_check_one(db, row)
+        summary.append({
+            "id": row.id,
+            "label": row.label,
+            **result,
+        })
+    _audit("cloud139_force_run", detail=f"count={len(summary)}")
+    return {"checked": len(summary), "results": summary}
+
+
+@app.get("/api/cloud139/wxwork")
+def api_cloud139_wxwork_get(db: Session = Depends(get_db)):
+    cfg = _get_setting(db, "wxwork", {}) or {}
+    # Mask the secret so it can't be read back via the API.
+    secret = str(cfg.get("corpsecret") or "")
+    return {
+        "corpid":     str(cfg.get("corpid") or ""),
+        "corpsecret_set": bool(secret),
+        "corpsecret_hint": (secret[:3] + "***" + secret[-3:]) if len(secret) >= 6 else ("***" if secret else ""),
+        "agentid":    str(cfg.get("agentid") or ""),
+        "touser":     str(cfg.get("touser") or "@all"),
+    }
+
+
+@app.post("/api/cloud139/wxwork")
+def api_cloud139_wxwork_set(req: WxWorkConfigReq, db: Session = Depends(get_db)):
+    existing = _get_setting(db, "wxwork", {}) or {}
+    secret = req.corpsecret.strip()
+    # Empty corpsecret means "leave unchanged" (so admin can edit other fields
+    # without re-entering the secret).
+    if not secret:
+        secret = str(existing.get("corpsecret") or "")
+    cfg = {
+        "corpid":     req.corpid.strip(),
+        "corpsecret": secret,
+        "agentid":    req.agentid.strip(),
+        "touser":     (req.touser or "@all").strip() or "@all",
+    }
+    _set_setting(db, "wxwork", cfg)
+    _audit("cloud139_wxwork_set",
+           detail=f"corpid={cfg['corpid']} agentid={cfg['agentid']} secret_len={len(secret)}")
+    return {"ok": True}
+
+
+@app.post("/api/cloud139/wxwork/test")
+def api_cloud139_wxwork_test(db: Session = Depends(get_db)):
+    cfg = _get_setting(db, "wxwork", {}) or {}
+    wx = notify.WxWorkConfig(
+        corpid=str(cfg.get("corpid") or ""),
+        corpsecret=str(cfg.get("corpsecret") or ""),
+        agentid=str(cfg.get("agentid") or ""),
+        touser=str(cfg.get("touser") or "@all"),
+    )
+    if not wx.corpid or not wx.corpsecret or not wx.agentid:
+        raise HTTPException(status_code=400, detail="WxWork 未完整配置")
+    ok, err = notify.send_wxwork_text(
+        _get_sync_client(), wx,
+        "【lvyou-smsweb】企业微信通道连通性测试 ✓",
+    )
+    if not ok:
+        raise HTTPException(status_code=502, detail=err)
+    return {"ok": True}
+
+
+@app.post("/api/cloud139/interval")
+def api_cloud139_interval_set(req: Cloud139IntervalReq, db: Session = Depends(get_db)):
+    if req.interval_seconds < 300 or req.interval_seconds > 7 * 24 * 3600:
+        raise HTTPException(status_code=400, detail="interval 超出 300~604800 秒范围")
+    _set_setting(db, "cloud139_interval", req.interval_seconds)
+    _audit("cloud139_interval_set", detail=f"sec={req.interval_seconds}")
+    return {"ok": True, "interval_seconds": req.interval_seconds}
