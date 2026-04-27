@@ -34,6 +34,16 @@ const showWifiModal = ref(false)
 const showDetailModal = ref(false)
 const showOtaModal = ref(false)
 const showConfigModal = ref(false)
+const showCloud139Modal = ref(false)
+
+// cloud.139.com 保活
+const cloud139Accounts = ref([])
+const cloud139IntervalSec = ref(6 * 3600)
+const cloud139NewToken = ref('')
+const cloud139NewLabel = ref('')
+const cloud139Busy = ref(false)
+const wxworkCfg = ref({ corpid: '', corpsecret: '', agentid: '', touser: '@all', corpsecret_set: false, corpsecret_hint: '' })
+const wxworkSecretInput = ref('')
 
 const wifiSsid = ref('')
 const wifiPwd = ref('')
@@ -468,6 +478,151 @@ function closeOtaModal() {
   otaResults.value = []
 }
 
+async function openCloud139Modal() {
+  showCloud139Modal.value = true
+  await Promise.all([refreshCloud139Accounts(), refreshWxworkCfg()])
+}
+
+function closeCloud139Modal() {
+  showCloud139Modal.value = false
+  cloud139NewToken.value = ''
+  cloud139NewLabel.value = ''
+  wxworkSecretInput.value = ''
+}
+
+async function refreshCloud139Accounts() {
+  try {
+    const r = await api.get('/api/cloud139/accounts')
+    cloud139Accounts.value = (r.data && r.data.accounts) || []
+    cloud139IntervalSec.value = (r.data && r.data.interval_seconds) || 6 * 3600
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '加载云手机账号失败', 'err')
+  }
+}
+
+async function refreshWxworkCfg() {
+  try {
+    const r = await api.get('/api/cloud139/wxwork')
+    wxworkCfg.value = { ...r.data, corpsecret: '' }
+  } catch (e) {
+    // ignore
+  }
+}
+
+async function saveCloud139Token() {
+  const tok = (cloud139NewToken.value || '').trim()
+  if (!tok) {
+    setNotice('请粘贴 cloud.139.com 的 nToken', 'err')
+    return
+  }
+  cloud139Busy.value = true
+  try {
+    const r = await api.post('/api/cloud139/accounts', {
+      token: tok,
+      label: (cloud139NewLabel.value || '').trim(),
+    })
+    cloud139NewToken.value = ''
+    cloud139NewLabel.value = ''
+    setNotice('已保存。' + (r.data && r.data.check && r.data.check.ok ? '保活 ping 成功 ✓' : '保活 ping 失败：' + (r.data?.check?.message || '')), r.data?.check?.ok ? 'ok' : 'warn')
+    await refreshCloud139Accounts()
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '保存失败', 'err')
+  } finally {
+    cloud139Busy.value = false
+  }
+}
+
+async function checkCloud139Account(account) {
+  cloud139Busy.value = true
+  try {
+    const r = await api.post(`/api/cloud139/accounts/${account.id}/check`)
+    const ok = r.data?.check?.ok
+    setNotice(ok ? `${account.label || '#' + account.id} 保活 ping 成功 ✓` : `保活失败：${r.data?.check?.message || ''}`, ok ? 'ok' : 'err')
+    await refreshCloud139Accounts()
+  } catch (e) {
+    setNotice('检查失败', 'err')
+  } finally {
+    cloud139Busy.value = false
+  }
+}
+
+async function deleteCloud139Account(account) {
+  if (!confirm(`删除账号 ${account.label || '#' + account.id}？`)) return
+  try {
+    await api.delete(`/api/cloud139/accounts/${account.id}`)
+    setNotice('已删除', 'ok')
+    await refreshCloud139Accounts()
+  } catch (e) {
+    setNotice('删除失败', 'err')
+  }
+}
+
+async function runCloud139Now() {
+  cloud139Busy.value = true
+  try {
+    const r = await api.post('/api/cloud139/run')
+    const fail = (r.data?.results || []).filter(x => !x.ok).length
+    setNotice(`保活完成，共 ${r.data?.checked} 个账号，失败 ${fail} 个`, fail ? 'warn' : 'ok')
+    await refreshCloud139Accounts()
+  } catch (e) {
+    setNotice('运行失败', 'err')
+  } finally {
+    cloud139Busy.value = false
+  }
+}
+
+async function saveWxworkCfg() {
+  try {
+    await api.post('/api/cloud139/wxwork', {
+      corpid: wxworkCfg.value.corpid || '',
+      corpsecret: wxworkSecretInput.value || '',
+      agentid: wxworkCfg.value.agentid || '',
+      touser: wxworkCfg.value.touser || '@all',
+    })
+    wxworkSecretInput.value = ''
+    setNotice('企业微信配置已保存', 'ok')
+    await refreshWxworkCfg()
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '保存失败', 'err')
+  }
+}
+
+async function testWxwork() {
+  try {
+    await api.post('/api/cloud139/wxwork/test')
+    setNotice('已发送测试消息，请查收企业微信 ✓', 'ok')
+  } catch (e) {
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || '测试失败', 'err')
+  }
+}
+
+async function saveCloud139Interval() {
+  const sec = parseInt(cloud139IntervalSec.value, 10)
+  if (!sec || sec < 300 || sec > 7 * 24 * 3600) {
+    setNotice('间隔需在 300 ~ 604800 秒之间', 'err')
+    return
+  }
+  try {
+    await api.post('/api/cloud139/interval', { interval_seconds: sec })
+    setNotice('保活间隔已更新', 'ok')
+    await refreshCloud139Accounts()
+  } catch (e) {
+    setNotice('保存失败', 'err')
+  }
+}
+
+function fmtCloud139Time(ts) {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function fmtCloud139Exp(sec) {
+  if (!sec) return '-'
+  const d = new Date(sec * 1000)
+  return d.toLocaleString('zh-CN', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
 async function checkOta() {
   loading.value = true
   try {
@@ -842,6 +997,7 @@ function wifiDbmLabel(dbm) {
             {{ scanning ? '扫描中...' : '扫描' }}
           </button>
           <button class="header-btn" @click="refresh" :disabled="loading">刷新</button>
+          <button class="header-btn" @click="openCloud139Modal">云手机保活</button>
           <button class="header-btn logout" @click="logout(true)">退出</button>
         </div>
       </header>
@@ -1227,6 +1383,110 @@ function wifiDbmLabel(dbm) {
         </div>
       </div>
 
+      <div v-if="showCloud139Modal" class="modal-overlay" @click.self="closeCloud139Modal">
+        <div class="modal modal-xl">
+          <div class="modal-header">
+            <h3>云手机保活 (cloud.139.com)</h3>
+            <button class="modal-close" @click="closeCloud139Modal">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="cloud139-section">
+              <p class="config-info">
+                后端会按下方配置的间隔自动调用 <code>/user/checkToken</code> 续命；token 失效时通过企业微信通知。
+                token 获取方式：浏览器登录 <a href="https://cloud.139.com/?channelSrc=02047" target="_blank" rel="noopener">cloud.139.com</a> 后，F12 → Application → Local Storage → 复制 <code>nToken</code> 值粘贴到下方。
+              </p>
+            </div>
+
+            <div class="cloud139-section">
+              <p class="config-section-title">已配置账号 ({{ cloud139Accounts.length }})</p>
+              <table class="cloud139-table" v-if="cloud139Accounts.length > 0">
+                <thead>
+                  <tr>
+                    <th>标签</th>
+                    <th>账号 hash</th>
+                    <th>登录方式</th>
+                    <th>token 过期</th>
+                    <th>最近一次保活</th>
+                    <th>状态</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="a in cloud139Accounts" :key="a.id">
+                    <td>{{ a.label || '-' }}</td>
+                    <td class="mono">{{ a.account_hash || '-' }}</td>
+                    <td>{{ a.login_method || '-' }}</td>
+                    <td>{{ fmtCloud139Exp(a.exp) }}</td>
+                    <td>{{ fmtCloud139Time(a.last_check_at) }}</td>
+                    <td>
+                      <span v-if="!a.last_check_at" class="cloud139-status pending">未检查</span>
+                      <span v-else-if="a.last_check_ok" class="cloud139-status ok">✓ {{ a.last_check_msg || 'success' }}</span>
+                      <span v-else class="cloud139-status err">✗ {{ a.last_check_msg || 'fail' }}</span>
+                    </td>
+                    <td>
+                      <button class="card-btn" @click="checkCloud139Account(a)" :disabled="cloud139Busy">立即检查</button>
+                      <button class="card-btn danger" @click="deleteCloud139Account(a)">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else class="config-hint">暂无账号，请在下方粘贴 token。</p>
+            </div>
+
+            <div class="cloud139-section">
+              <p class="config-section-title">添加 / 更新 token</p>
+              <input v-model="cloud139NewLabel" class="form-input" placeholder="标签（可选，例如 主号 / 备机）" maxlength="64" />
+              <textarea
+                v-model="cloud139NewToken"
+                class="form-textarea-full"
+                rows="4"
+                placeholder="粘贴 cloud.139.com localStorage 的 nToken（eyJh... 开头的 JWT）"
+              ></textarea>
+              <div class="config-btn-row">
+                <button class="btn-confirm" @click="saveCloud139Token" :disabled="cloud139Busy || !cloud139NewToken">
+                  保存并立即检查
+                </button>
+                <button class="btn-cancel" @click="runCloud139Now" :disabled="cloud139Busy">立即跑一次保活</button>
+              </div>
+            </div>
+
+            <div class="cloud139-section">
+              <p class="config-section-title">保活间隔</p>
+              <div class="cloud139-interval-row">
+                <input v-model.number="cloud139IntervalSec" type="number" class="form-input" min="300" max="604800" />
+                <span class="config-hint">秒（最少 300，最多 7 天）</span>
+                <button class="btn-confirm" @click="saveCloud139Interval">保存</button>
+              </div>
+            </div>
+
+            <div class="cloud139-section">
+              <p class="config-section-title">企业微信通知（失效告警）</p>
+              <div class="cloud139-form-grid">
+                <input v-model="wxworkCfg.corpid"  class="form-input" placeholder="corpid (ww...)" />
+                <input v-model="wxworkCfg.agentid" class="form-input" placeholder="agentid (1000002 ...)" />
+                <input
+                  v-model="wxworkSecretInput"
+                  class="form-input"
+                  type="password"
+                  :placeholder="wxworkCfg.corpsecret_set ? `已保存 (${wxworkCfg.corpsecret_hint})，留空表示不修改` : 'corpsecret'"
+                />
+                <input v-model="wxworkCfg.touser"  class="form-input" placeholder="接收人 (默认 @all)" />
+              </div>
+              <div class="config-btn-row">
+                <button class="btn-confirm" @click="saveWxworkCfg">保存</button>
+                <button class="btn-cancel" @click="testWxwork">发送测试消息</button>
+              </div>
+              <p class="config-hint">
+                corpsecret 仅前端不回传，后端 SQLite 中以 KV 形式保存。建议为 lvyou-smsweb 单独建一个企业微信应用，secret 仅授予该应用。
+              </p>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-cancel" @click="closeCloud139Modal">关闭</button>
+          </div>
+        </div>
+      </div>
+
       <div v-if="showDetailModal && deviceDetail" class="modal-overlay" @click.self="closeDetailModal">
         <div class="modal">
           <div class="modal-header">
@@ -1552,4 +1812,26 @@ body {
 .preview-ip { font-family: monospace; font-size: 13px; flex: 1; }
 .preview-alias { color: var(--text-secondary); font-size: 12px; flex: 1; }
 .preview-status { color: var(--primary); font-size: 12px; flex: 2; }
+
+.cloud139-section { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.cloud139-section:last-child { border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
+.cloud139-section .form-input,
+.cloud139-section .form-textarea-full { margin-bottom: 8px; }
+.cloud139-section a { color: var(--primary); text-decoration: underline; }
+.cloud139-section code { background: var(--bg-dark); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+.cloud139-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.cloud139-table th, .cloud139-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; text-align: left; }
+.cloud139-table th { background: var(--bg-dark); color: var(--text-secondary); font-weight: 500; }
+.cloud139-table td.mono { font-family: monospace; font-size: 12px; }
+.cloud139-status { padding: 2px 8px; border-radius: 6px; font-size: 12px; }
+.cloud139-status.ok { background: rgba(40, 200, 80, 0.15); color: var(--success); }
+.cloud139-status.err { background: rgba(220, 60, 60, 0.15); color: var(--danger, #d44); }
+.cloud139-status.pending { background: var(--bg-dark); color: var(--text-secondary); }
+.cloud139-interval-row { display: flex; align-items: center; gap: 12px; }
+.cloud139-interval-row .form-input { width: 160px; margin-bottom: 0; }
+.cloud139-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+@media (max-width: 720px) {
+  .cloud139-form-grid { grid-template-columns: 1fr; }
+  .cloud139-table { font-size: 12px; }
+}
 </style>
