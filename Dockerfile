@@ -27,7 +27,7 @@ FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 
 # 安装 pnpm
-RUN npm install -g pnpm@9
+RUN npm install -g pnpm@8
 
 # 先复制依赖文件（利用 Docker 缓存）
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
