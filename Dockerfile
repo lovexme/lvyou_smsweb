@@ -67,25 +67,35 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt \
 
 # 复制后端代码
 COPY backend/ /app/backend/
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 # 从前端构建阶段复制产物（不含 Node.js / node_modules）
 COPY --from=frontend-builder /app/frontend/dist /opt/board-manager/static
 
-# 创建数据目录
-RUN mkdir -p /opt/board-manager/data
+# FIX(P0#3): create a dedicated unprivileged user and chown the writable
+# data dir to it so the container does not run as root. uid/gid 1000 is
+# used so volumes mounted from the host are easy to interact with.
+RUN groupadd --system --gid 1000 board-manager \
+    && useradd  --system --uid 1000 --gid 1000 \
+                --home-dir /opt/board-manager --shell /usr/sbin/nologin \
+                board-manager \
+    && mkdir -p /opt/board-manager/data \
+    && chown -R board-manager:board-manager /opt/board-manager \
+    && chmod 0750 /opt/board-manager/data
 
 # 设置环境变量
 ENV BMDB=/opt/board-manager/data/data.db
 ENV BMSTATIC=/opt/board-manager/static
-ENV BMDEVUSER=admin
-ENV BMDEVPASS=admin
 ENV BMUIUSER=admin
-ENV BMUIPASS=admin
+# FIX(P0#1): leave BMUIPASS unset on purpose so that the empty default
+# from main.py (now '') triggers _validate_startup_security() and refuses
+# to start with admin/admin. Operators must set BMUIPASS explicitly.
 ENV BMHTTPTIMEOUT=5.0
 ENV BMSCANCONCURRENCY=64
 ENV BMTCPCONCURRENCY=128
 ENV BMSCANRETRIES=3
 ENV BMSCANTTL=3600
+ENV BMCONFIGBATCHMAX=64
 ENV BMSMSRATELIMIT=10
 ENV BMDIALRATELIMIT=5
 ENV BMLOGINRATELIMIT=5
@@ -96,9 +106,15 @@ ENV SERVER_PORT=8000
 # 暴露端口
 EXPOSE 8000
 
-# 健康检查（shell 形式，容器内运行时解析 SERVER_PORT）
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f "http://localhost:${SERVER_PORT}/api/health" || exit 1
+# FIX(P2#10): /api/health now pings the SQLite DB and returns 503 on
+# failure, so this catches stuck-but-listening processes too. The
+# start_period is 30s (was 5s) -- enough for cold DB init and the first
+# SQLAlchemy connect on slow disks.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -fsS "http://localhost:${SERVER_PORT}/api/health" || exit 1
 
-# 启动命令（支持自定义端口，同时监听 IPv4 和 IPv6）
-CMD ["sh", "-c", "python -m uvicorn backend.main:app --host 0.0.0.0 --port ${SERVER_PORT} & python -m uvicorn backend.main:app --host :: --port ${SERVER_PORT} & wait"]
+# FIX(P0#3): drop privileges before launching uvicorn.
+USER board-manager:board-manager
+
+# 启动命令：双进程分别监听 IPv4 和 IPv6，entrypoint 处理信号转发
+CMD ["/app/docker-entrypoint.sh"]

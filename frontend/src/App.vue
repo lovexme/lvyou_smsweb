@@ -1,23 +1,96 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import axios from 'axios'
+import { storeToRefs } from 'pinia'
 
-const api = axios.create({ baseURL: '' })
+import {
+  applyWifiBatch,
+  checkOtaBatch,
+  fetchDeviceDetail,
+  previewConfigPreset,
+  previewDeviceConfig,
+  previewWifiBatch,
+  readDeviceConfigs,
+  saveDeviceSim,
+  sendSms,
+  dialDevice,
+  upgradeOtaBatch,
+  writeConfigPreset,
+  writeDeviceConfig
+} from './api/endpoints'
 
-const TOKEN_KEY = 'board_mgr_token'
-const TOKEN_EXPIRES_KEY = 'board_mgr_token_expires'
+import {
+  useAuthStore,
+  useDevicesStore,
+  useDialogStore,
+  useNoticeStore,
+  useScanStore
+} from './stores'
 
-const uiPass = ref('')
-const authed = ref(false)
+import AppHeader from './components/AppHeader.vue'
+import ConfirmModal from './components/ConfirmModal.vue'
+import DetailModal from './components/DetailModal.vue'
+import LoginView from './components/LoginView.vue'
+import NoticeBar from './components/NoticeBar.vue'
+import OtaModal from './components/OtaModal.vue'
+import MessagePanel from './components/MessagePanel.vue'
+import Pagination from './components/Pagination.vue'
+import PromptModal from './components/PromptModal.vue'
+import StatsGrid from './components/StatsGrid.vue'
+import WifiModal from './components/WifiModal.vue'
+import { displayName, prettyTime } from './utils/format'
+
+// FIX(P2#5): App.vue is now a thin shell. Auth, devices and scan state
+// (the four most reused groups) live in Pinia stores; the component
+// keeps only the bits that are inseparable from the template -- modal
+// open/close flags, the SMS/dial/OTA/WiFi/config workflows, and the
+// thin wrappers below that bridge template events to store actions.
+
+const authStore = useAuthStore()
+const noticeStore = useNoticeStore()
+const devicesStore = useDevicesStore()
+const scanStore = useScanStore()
+const dialogStore = useDialogStore()
+
+const { authed, uiPass } = storeToRefs(authStore)
+const { text: noticeText, type: noticeType } = storeToRefs(noticeStore)
+const {
+  devices,
+  numbers,
+  allNumbers,
+  searchText,
+  groupFilter,
+  selectedIds,
+  uniqueGroups,
+  onlineCount,
+  offlineCount,
+  selectedCount,
+  filteredDevices,
+  filteredNumbers
+} = storeToRefs(devicesStore)
+const { scanning } = storeToRefs(scanStore)
+
+// Composite notice payload preserved for child components that expect
+// the legacy `{ text, type }` shape.
+const notice = computed(() => ({ text: noticeText.value, type: noticeType.value }))
+
+// FIX(P2#7, Devin Review #8): the select-all checkbox's checked /
+// indeterminate state must reflect *current page* membership to stay
+// consistent with toggleSelectAll(), which only acts on the visible
+// page. Without this, selecting page 1 (100/100 items) and paginating
+// to page 2 would leave the header checkbox visually fully-checked
+// even though no item on page 2 is selected.
+const currentPageSelectedCount = computed(
+  () => devices.value.filter(d => selectedIds.value.includes(d.id)).length
+)
+
+// `loading` is the shared "something is in flight" spinner used by every
+// modal and toolbar button. It still lives in App.vue because a handful
+// of unmoved workflows (SMS, dial, OTA, WiFi, config IO, detail/SIM)
+// drive it directly. Store actions toggle their own loading flags;
+// the thin wrappers below mirror them into this ref for the global UI.
 const loading = ref(false)
-const notice = ref({ text: '', type: 'info' })
-
-const devices = ref([])
-const numbers = ref([])
 
 const activeTab = ref('devices')
-const searchText = ref('')
-const groupFilter = ref('all')
 
 const fromSelected = ref('')
 const toPhone = ref('')
@@ -27,9 +100,6 @@ const commMode = ref('sms')
 const dialPhone = ref('')
 const ttsText = ref('')
 
-const selectedIds = ref([])
-const selectAll = ref(false)
-
 const showWifiModal = ref(false)
 const showDetailModal = ref(false)
 const showOtaModal = ref(false)
@@ -38,9 +108,8 @@ const showConfigModal = ref(false)
 const wifiSsid = ref('')
 const wifiPwd = ref('')
 const deviceDetail = ref(null)
-const wifiPreviewResults = ref([]) // WiFi配置预览结果
+const wifiPreviewResults = ref([])
 
-// OTA相关变量
 const otaResults = ref([])
 const otaUpgrading = ref(false)
 
@@ -53,255 +122,122 @@ const configPreviewData = ref([])
 const configExpandedIds = ref([])
 const configMode = ref('regex')
 
-const scanCidr = ref('')
-const scanUser = ref('admin')
-const scanPass = ref('admin')
-const scanGroup = ref('')
-const scanning = ref(false)
-
 function setNotice(text, type = 'info') {
-  notice.value = { text, type }
+  noticeStore.set(text, type)
 }
 
 function clearNotice() {
-  notice.value = { text: '', type: 'info' }
+  noticeStore.clear()
 }
 
-function setToken(token) {
-  api.defaults.headers.common.Authorization = 'Bearer ' + token
-}
-
-function clearToken() {
-  delete api.defaults.headers.common.Authorization
-}
-
-function saveAuth(token, expiresIn) {
-  const expiresAt = Date.now() + (expiresIn * 1000)
-  localStorage.setItem(TOKEN_KEY, token)
-  localStorage.setItem(TOKEN_EXPIRES_KEY, String(expiresAt))
-  setToken(token)
-}
-
-function clearStoredAuth() {
-  localStorage.removeItem(TOKEN_KEY)
-  localStorage.removeItem(TOKEN_EXPIRES_KEY)
-  clearToken()
-}
-
-function restoreAuth() {
-  const token = localStorage.getItem(TOKEN_KEY)
-  const expiresAt = parseInt(localStorage.getItem(TOKEN_EXPIRES_KEY) || '0', 10)
-  if (!token || !expiresAt || Date.now() >= expiresAt) {
-    clearStoredAuth()
-    return false
-  }
-  setToken(token)
-  return true
-}
-
-// FIX: 登录页新增 HTTP 429 频率限制错误提示
 async function login() {
-  const password = uiPass.value.trim()
-  if (!password) {
-    setNotice('请输入密码', 'err')
-    return
-  }
   loading.value = true
-  clearNotice()
   try {
-    const response = await api.post('/api/login', { username: 'admin', password })
-    const data = response.data || {}
-    saveAuth(data.token, data.expiresIn || 28800)
-    authed.value = true
-    uiPass.value = ''
-    setNotice('登录成功', 'ok')
-    await refresh()
-  } catch (e) {
-    authed.value = false
-    clearStoredAuth()
-    const status = e && e.response && e.response.status
-    const detail = e && e.response && e.response.data && e.response.data.detail
-    if (status === 429) {
-      setNotice(detail || '登录尝试过于频繁，请稍后再试', 'err')
-    } else if (status === 401) {
-      setNotice('密码错误，请重试', 'err')
-    } else {
-      setNotice(detail || '连接失败，请检查服务是否运行', 'err')
-    }
+    const ok = await authStore.login()
+    if (ok) await devicesStore.refresh()
   } finally {
     loading.value = false
   }
 }
 
 async function logout(showMsg = false) {
-  try {
-    await api.post('/api/logout')
-  } catch {
-    // ignore
-  }
-  authed.value = false
-  uiPass.value = ''
-  clearStoredAuth()
-  selectedIds.value = []
-  selectAll.value = false
-  if (showMsg) {
-    setNotice('已退出登录', 'info')
-  } else {
-    clearNotice()
-  }
-}
-
-api.interceptors.response.use(
-  response => response,
-  async error => {
-    if (error && error.response && error.response.status === 401 && authed.value) {
-      await logout()
-      setNotice('登录已失效，请重新输入密码', 'err')
-    }
-    return Promise.reject(error)
-  }
-)
-
-onMounted(async () => {
-  if (!restoreAuth()) return
-  loading.value = true
-  try {
-    await api.get('/api/health')
-    authed.value = true
-    await refresh()
-  } catch {
-    await logout()
-    setNotice('登录已过期，请重新登录', 'err')
-  } finally {
-    loading.value = false
-  }
-})
-
-const uniqueGroups = computed(() => {
-  const groupSet = new Set(['all'])
-  devices.value.forEach(device => {
-    if (device.grp) groupSet.add(device.grp)
-  })
-  return Array.from(groupSet)
-})
-
-const onlineCount = computed(() => devices.value.filter(device => device.status === 'online').length)
-const offlineCount = computed(() => devices.value.filter(device => device.status !== 'online').length)
-const selectedCount = computed(() => selectedIds.value.length)
-
-const filteredDevices = computed(() => {
-  return devices.value.filter(device => {
-    const keyword = searchText.value.toLowerCase()
-    const matchSearch = !keyword ||
-      (device.ip || '').toLowerCase().includes(keyword) ||
-      (device.mac || '').toLowerCase().includes(keyword) ||
-      (device.devId || '').toLowerCase().includes(keyword) ||
-      (device.alias || '').toLowerCase().includes(keyword) ||
-      (device.sims && device.sims.sim1 && device.sims.sim1.number || '').includes(keyword) ||
-      (device.sims && device.sims.sim2 && device.sims.sim2.number || '').includes(keyword) ||
-      (device.sims && device.sims.sim1 && device.sims.sim1.operator || '').toLowerCase().includes(keyword) ||
-      (device.sims && device.sims.sim2 && device.sims.sim2.operator || '').toLowerCase().includes(keyword)
-    const matchGroup = groupFilter.value === 'all' || device.grp === groupFilter.value
-    return matchSearch && matchGroup
-  })
-})
-
-const filteredNumbers = computed(() => {
-  return numbers.value.filter(item => {
-    const keyword = searchText.value.toLowerCase()
-    return !keyword ||
-      (item.number || '').includes(keyword) ||
-      (item.operator || '').toLowerCase().includes(keyword) ||
-      (item.deviceName || '').toLowerCase().includes(keyword)
-  })
-})
-
-function displayName(device) {
-  return (device.alias || '').trim() || device.devId || device.ip
-}
-
-function prettyTime(ts) {
-  if (!ts) return '-'
-  const d = new Date(ts * 1000)
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  // authStore.logout() also clears the device selection (see store impl
+  // for the 401-interceptor regression note), so this wrapper is purely
+  // a thin adapter for the LoginView's @logout event.
+  await authStore.logout(showMsg)
 }
 
 async function refresh() {
   loading.value = true
   try {
-    const result = await Promise.all([
-      api.get('/api/devices'),
-      api.get('/api/numbers')
-    ])
-    const devData = result[0].data
-    devices.value = Array.isArray(devData) ? devData : (devData.items || [])
-    const numData = result[1].data
-    numbers.value = Array.isArray(numData) ? numData : (numData.items || [])
-  } catch (e) {
-    if (!(e && e.response && e.response.status === 401)) {
-      setNotice('获取数据失败，请检查网络连接', 'err')
-    }
+    await devicesStore.refresh()
   } finally {
     loading.value = false
   }
 }
 
-function toggleSelectAll() {
-  const isAllSelected = selectedCount.value === filteredDevices.value.length && filteredDevices.value.length > 0
-  selectedIds.value = isAllSelected ? [] : filteredDevices.value.map(device => device.id)
+async function startScanAdd() {
+  await scanStore.start()
 }
 
-// FIX: 凭据改为 POST Body；用 completed 标志防止超时误判
-async function startScanAdd() {
-  scanning.value = true
-  setNotice('正在提交扫描任务...', 'info')
+onMounted(async () => {
+  loading.value = true
   try {
-    const scanResp = await api.post('/api/scan/start', {
-      cidr:     scanCidr.value  || undefined,
-      group:    scanGroup.value || undefined,
-      user:     scanUser.value,
-      password: scanPass.value
-    })
-    const scanId = scanResp.data && scanResp.data.scanId
-    if (!scanId) {
-      setNotice('扫描任务创建失败', 'err')
-      scanning.value = false
-      return
+    if (await authStore.restore()) {
+      await devicesStore.refresh()
     }
-    setNotice('扫描进行中，请稍候...', 'info')
-    let completed = false
-    for (let i = 0; i < 60; i++) {
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      try {
-        const statusResp = await api.get('/api/scan/status/' + scanId)
-        const st = statusResp.data || {}
-        const progress = st.progress || ''
-        if (st.status === 'done') {
-          completed = true
-          setNotice(`扫描完成，发现 ${st.found} 台设备`, st.found ? 'ok' : 'warn')
-          await refresh()
-          break
-        } else if (st.status === 'error') {
-          completed = true
-          setNotice(progress || '扫描出错', 'err')
-          break
-        } else if (progress) {
-          setNotice(`扫描中: ${progress}`, 'info')
-        }
-      } catch {
-        // 状态查询失败，继续重试
-      }
-    }
-    // FIX: 只在确实未完成时才提示超时
-    if (!completed) {
-      setNotice('扫描超时，设备可能稍后出现，可点一次刷新确认', 'warn')
-      await refresh()
-    }
-  } catch (e) {
-    const detail = e && e.response && e.response.data && e.response.data.detail
-    setNotice(detail || '扫描启动失败，请检查网络连接', 'err')
   } finally {
-    scanning.value = false
+    loading.value = false
+  }
+})
+
+function toggleSelectAll() {
+  devicesStore.toggleSelectAll()
+}
+
+function toggleSelect(id) {
+  devicesStore.toggleSelect(id)
+}
+
+function isSelected(id) {
+  return devicesStore.isSelected(id)
+}
+
+async function renameDevice(device) {
+  const name = await dialogStore.prompt({
+    title: '修改设备别名',
+    label: '请输入设备别名：',
+    defaultValue: device.alias || '',
+    placeholder: '别名'
+  })
+  if (name === null) return
+  await devicesStore.rename(device, name)
+}
+
+async function setGroup(device) {
+  const group = await dialogStore.prompt({
+    title: '修改设备分组',
+    label: '请输入分组名称：',
+    defaultValue: device.grp || 'auto',
+    placeholder: '分组'
+  })
+  if (group === null) return
+  await devicesStore.regroup(device, group)
+}
+
+async function deleteDevice(device) {
+  const ok = await dialogStore.confirm({
+    title: '删除设备',
+    message: `确认删除设备 ${displayName(device)}？`,
+    confirmText: '删除',
+    danger: true
+  })
+  if (!ok) return
+  loading.value = true
+  try {
+    await devicesStore.deleteOne(device)
+  } finally {
+    loading.value = false
+  }
+}
+
+async function batchDeleteSelected() {
+  if (!selectedCount.value) {
+    setNotice('请先勾选设备', 'err')
+    return
+  }
+  const ok = await dialogStore.confirm({
+    title: '批量删除',
+    message: `确认删除所选 ${selectedCount.value} 台设备？`,
+    confirmText: '删除',
+    danger: true
+  })
+  if (!ok) return
+  loading.value = true
+  try {
+    await devicesStore.batchDeleteSelected()
+  } finally {
+    loading.value = false
   }
 }
 
@@ -327,25 +263,17 @@ async function send() {
   }
   loading.value = true
   try {
-    await api.post('/api/sms/send-direct', {
+    await sendSms({
       deviceId: sender.deviceId,
       phone: toPhone.value,
       content: content.value,
       slot: sender.slot
     })
-    setNotice('短信已发送', 'ok')
+    setNotice('已发送', 'ok')
     toPhone.value = ''
     content.value = ''
   } catch (e) {
-    const status = e && e.response && e.response.status
-    const detail = e && e.response && e.response.data && e.response.data.detail
-    if (status === 429) {
-      setNotice(detail || '发送过于频繁，请稍后再试', 'err')
-    } else if (status === 400) {
-      setNotice(detail || '参数错误，请检查手机号和内容', 'err')
-    } else {
-      setNotice(detail || '发送失败，请检查网络和设备状态', 'err')
-    }
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '发送失败', 'err')
   } finally {
     loading.value = false
   }
@@ -358,82 +286,25 @@ async function dial() {
   }
   const sender = parseSenderValue()
   if (!sender) {
-    setNotice('请选择有效的发送卡号', 'err')
+    setNotice('请选择有效的拨号卡号', 'err')
     return
   }
   loading.value = true
   try {
-    await api.post('/api/tel/dial', {
+    await dialDevice({
       deviceId: sender.deviceId,
-      slot: sender.slot,
       phone: dialPhone.value,
+      slot: sender.slot,
       tts: ttsText.value
     })
-    setNotice('拨号已执行', 'ok')
+    setNotice('已拨出', 'ok')
     dialPhone.value = ''
     ttsText.value = ''
   } catch (e) {
-    const status = e && e.response && e.response.status
-    const detail = e && e.response && e.response.data && e.response.data.detail
-    if (status === 429) {
-      setNotice(detail || '拨号过于频繁，请稍后再试', 'err')
-    } else {
-      setNotice(detail || '拨号失败，请检查网络和设备状态', 'err')
-    }
+    setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '拨号失败', 'err')
   } finally {
     loading.value = false
   }
-}
-
-async function renameDevice(device) {
-  const name = prompt('请输入设备别名：', device.alias || '')
-  if (name === null) return
-  try {
-    await api.post('/api/devices/' + device.id + '/alias', { alias: name })
-    setNotice('已更新别名', 'ok')
-    await refresh()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || '更新失败', 'err')
-  }
-}
-
-async function setGroup(device) {
-  const group = prompt('请输入分组名称：', device.grp || 'auto')
-  if (group === null) return
-  try {
-    await api.post('/api/devices/' + device.id + '/group', { group })
-    setNotice('已更新分组', 'ok')
-    await refresh()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || '更新失败', 'err')
-  }
-}
-
-async function deleteDevice(device) {
-  if (!confirm('确认删除设备 ' + displayName(device) + '？')) return
-  loading.value = true
-  try {
-    await api.delete('/api/devices/' + device.id)
-    setNotice('已删除', 'ok')
-    await refresh()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || '删除失败', 'err')
-  } finally {
-    loading.value = false
-  }
-}
-
-function toggleSelect(id) {
-  const idx = selectedIds.value.indexOf(id)
-  if (idx > -1) {
-    selectedIds.value.splice(idx, 1)
-  } else {
-    selectedIds.value.push(id)
-  }
-}
-
-function isSelected(id) {
-  return selectedIds.value.includes(id)
 }
 
 function openWifiModal() {
@@ -448,7 +319,7 @@ function closeWifiModal() {
   showWifiModal.value = false
   wifiSsid.value = ''
   wifiPwd.value = ''
-  wifiPreviewResults.value = [] // 清空预览结果
+  wifiPreviewResults.value = []
 }
 
 function openOtaModal() {
@@ -459,8 +330,6 @@ function openOtaModal() {
   otaResults.value = []
   otaUpgrading.value = false
   showOtaModal.value = true
-  // 不自动检查版本，改为手动点击「检查版本」
-  // checkOta() // 移除自动检查
 }
 
 function closeOtaModal() {
@@ -471,9 +340,7 @@ function closeOtaModal() {
 async function checkOta() {
   loading.value = true
   try {
-    const response = await api.post('/api/devices/batch/ota/check', {
-      device_ids: selectedIds.value,
-    })
+    const response = await checkOtaBatch(selectedIds.value)
     otaResults.value = response.data && response.data.results ? response.data.results : []
   } catch (e) {
     setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '检查失败', 'err')
@@ -488,20 +355,22 @@ async function upgradeOta() {
     setNotice('没有可升级的设备', 'warn')
     return
   }
-  if (!confirm(`确定要升级 ${hasUpdateDevices.length} 台设备吗？设备会重启。`)) {
-    return
-  }
+  const ok = await dialogStore.confirm({
+    title: '确认 OTA 升级',
+    message: `确定要升级 ${hasUpdateDevices.length} 台设备吗？设备会重启。`,
+    confirmText: '升级',
+    danger: true
+  })
+  if (!ok) return
   otaUpgrading.value = true
   loading.value = true
   try {
-    const response = await api.post('/api/devices/batch/ota/upgrade', {
-      device_ids: selectedIds.value,
-    })
+    const response = await upgradeOtaBatch(selectedIds.value)
     const results = response.data && response.data.results ? response.data.results : []
     const okCount = results.filter(r => r.ok).length
     setNotice('OTA升级完成：' + okCount + '/' + results.length, okCount ? 'ok' : 'err')
     closeOtaModal()
-    await refresh()
+    await devicesStore.refresh()
   } catch (e) {
     setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '升级失败', 'err')
   } finally {
@@ -540,9 +409,7 @@ async function readConfigs() {
   }
   loading.value = true
   try {
-    const resp = await api.post('/api/devices/batch/config/read', {
-      device_ids: selectedIds.value
-    })
+    const resp = await readDeviceConfigs(selectedIds.value)
     configData.value = resp.data && resp.data.configs ? resp.data.configs : []
     configStep.value = 'edit'
     const firstOk = configData.value.find(item => item.ok)
@@ -571,7 +438,7 @@ async function previewConfig() {
   }
   loading.value = true
   try {
-    const resp = await api.post('/api/devices/batch/config/preview', {
+    const resp = await previewDeviceConfig({
       device_ids: selectedIds.value,
       pattern: configPattern.value,
       replacement: configReplacement.value,
@@ -593,10 +460,7 @@ async function previewConfig() {
 async function previewCleanMessageTemplates() {
   loading.value = true
   try {
-    const resp = await api.post('/api/devices/batch/config/preset/preview', {
-      device_ids: selectedIds.value,
-      preset: 'clean_message_templates'
-    })
+    const resp = await previewConfigPreset(selectedIds.value, 'clean_message_templates')
     configPreviewData.value = resp.data && resp.data.previews ? resp.data.previews : []
     configStep.value = 'preview'
     configMode.value = 'clean_message_templates'
@@ -618,13 +482,19 @@ async function writeConfigs() {
     return
   }
   const modeText = configMode.value === 'clean_message_templates' ? '应用简洁消息模板' : '按正则替换'
-  if (!confirm(`确认对 ${changedCount} 台设备写入配置？\n本次操作：${modeText}。\n会先重新读取每台设备当前配置，写入后再读回校验。`)) return
+  const ok = await dialogStore.confirm({
+    title: '确认写入配置',
+    message: `确认对 ${changedCount} 台设备写入配置？\n本次操作：${modeText}。\n会先重新读取每台设备当前配置，写入后再读回校验。`,
+    confirmText: '写入',
+    danger: true
+  })
+  if (!ok) return
   loading.value = true
   try {
     const payload = { device_ids: selectedIds.value }
     const resp = configMode.value === 'clean_message_templates'
-      ? await api.post('/api/devices/batch/config/preset/write', { ...payload, preset: 'clean_message_templates' })
-      : await api.post('/api/devices/batch/config/write', {
+      ? await writeConfigPreset(selectedIds.value, 'clean_message_templates')
+      : await writeDeviceConfig({
         ...payload,
         pattern: configPattern.value,
         replacement: configReplacement.value,
@@ -671,7 +541,7 @@ async function previewWifi() {
   }
   loading.value = true
   try {
-    const response = await api.post('/api/devices/batch/wifi/preview', {
+    const response = await previewWifiBatch({
       device_ids: selectedIds.value,
       ssid: wifiSsid.value.trim(),
       pwd: wifiPwd.value.trim()
@@ -695,12 +565,9 @@ async function applyWifi() {
     setNotice('请先勾选设备', 'err')
     return
   }
-  // FIX(N7): preview is now optional — it really queries each device's
-  // current WiFi so it is still useful, but we no longer block the apply
-  // action when the operator chose to skip the preview step.
   loading.value = true
   try {
-    const response = await api.post('/api/devices/batch/wifi', {
+    const response = await applyWifiBatch({
       device_ids: selectedIds.value,
       ssid: wifiSsid.value.trim(),
       pwd: wifiPwd.value.trim()
@@ -708,7 +575,7 @@ async function applyWifi() {
     const list = response.data && response.data.results ? response.data.results : []
     const okCount = list.filter(item => item.ok).length
     setNotice('WiFi 添加完成：' + okCount + '/' + list.length, okCount ? 'ok' : 'err')
-    wifiPreviewResults.value = [] // 清空预览结果
+    wifiPreviewResults.value = []
     closeWifiModal()
   } catch (e) {
     setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '配置失败', 'err')
@@ -717,31 +584,10 @@ async function applyWifi() {
   }
 }
 
-async function batchDeleteSelected() {
-  if (!selectedCount.value) {
-    setNotice('请先勾选设备', 'err')
-    return
-  }
-  if (!confirm('确认删除所选 ' + selectedCount.value + ' 台设备？')) return
-  loading.value = true
-  try {
-    const response = await api.post('/api/devices/batch/delete', { device_ids: selectedIds.value })
-    const deleted = response.data && response.data.deleted ? response.data.deleted : 0
-    setNotice('删除完成：' + deleted + '/' + selectedCount.value, deleted ? 'ok' : 'warn')
-    selectedIds.value = []
-    selectAll.value = false
-    await refresh()
-  } catch (e) {
-    setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '删除失败', 'err')
-  } finally {
-    loading.value = false
-  }
-}
-
 async function showDetail(device) {
   loading.value = true
   try {
-    const response = await api.get('/api/devices/' + device.id + '/detail')
+    const response = await fetchDeviceDetail(device.id)
     deviceDetail.value = response.data
     showDetailModal.value = true
   } catch (e) {
@@ -761,12 +607,12 @@ async function saveSimSingle() {
   if (!id) return
   loading.value = true
   try {
-    await api.post('/api/devices/' + id + '/sim', {
+    await saveDeviceSim(id, {
       sim1: deviceDetail.value.device.sim1number || '',
       sim2: deviceDetail.value.device.sim2number || ''
     })
     setNotice('已保存卡号', 'ok')
-    await refresh()
+    await devicesStore.refresh()
   } catch (e) {
     setNotice((e && e.response && e.response.data && e.response.data.detail) || e.message || '保存失败', 'err')
   } finally {
@@ -774,82 +620,33 @@ async function saveSimSingle() {
   }
 }
 
-function wifiDbmColor(dbm) {
-  const v = parseInt(dbm, 10)
-  if (isNaN(v)) return 'var(--text-secondary)'
-  if (v >= 60) return 'var(--success)'
-  if (v >= 30) return 'var(--warning)'
-  return 'var(--danger)'
-}
-
-function wifiDbmLabel(dbm) {
-  const v = parseInt(dbm, 10)
-  if (isNaN(v) || !dbm) return '-'
-  if (v >= 60) return `${dbm} (强)`
-  if (v >= 30) return `${dbm} (中)`
-  return `${dbm} (弱)`
+function updateDetailSim(field, value) {
+  if (deviceDetail.value && deviceDetail.value.device) {
+    deviceDetail.value.device[field] = value
+  }
 }
 </script>
 
+
 <template>
   <div class="app">
-    <div v-if="!authed" class="login-container">
-      <div class="login-box">
-        <div class="login-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z" />
-            <path d="M12 6a2 2 0 100 4 2 2 0 000-4zm-4 8a4 4 0 118 0v1H8v-1z" />
-          </svg>
-        </div>
-        <h1 class="login-title">控制台</h1>
-        <p class="login-subtitle">请输入密码登录系统</p>
-        <div class="login-form">
-          <input
-            v-model="uiPass"
-            class="login-input"
-            type="password"
-            placeholder="请输入密码"
-            @keyup.enter="login"
-            autocomplete="current-password"
-          />
-          <button class="login-button" :disabled="loading" @click="login">
-            <span v-if="loading">验证中...</span>
-            <span v-else>登 录</span>
-          </button>
-        </div>
-        <div v-if="notice.text" class="login-notice" :class="'notice-' + notice.type">
-          {{ notice.text }}
-        </div>
-      </div>
-    </div>
+    <LoginView
+      v-if="!authed"
+      v-model:password="uiPass"
+      :loading="loading"
+      :notice="notice"
+      @login="login"
+    />
 
     <div v-else class="main-container">
-      <header class="header">
-        <div class="header-left">
-          <div class="logo" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z" />
-              <path d="M12 6a2 2 0 100 4 2 2 0 000-4zm-4 8a4 4 0 118 0v1H8v-1z" />
-            </svg>
-          </div>
-          <div class="header-title">
-            <h1>控制台</h1>
-            <p>管理中心</p>
-          </div>
-        </div>
-        <div class="header-right">
-          <button class="header-btn primary" @click="startScanAdd" :disabled="scanning">
-            {{ scanning ? '扫描中...' : '扫描' }}
-          </button>
-          <button class="header-btn" @click="refresh" :disabled="loading">刷新</button>
-          <button class="header-btn logout" @click="logout(true)">退出</button>
-        </div>
-      </header>
-
-      <div v-if="notice.text" class="notice-bar" :class="'notice-' + notice.type">
-        <span>{{ notice.text }}</span>
-        <button class="notice-close" @click="clearNotice">×</button>
-      </div>
+      <AppHeader
+        :loading="loading"
+        :scanning="scanning"
+        @scan="startScanAdd"
+        @refresh="refresh"
+        @logout="logout(true)"
+      />
+      <NoticeBar :notice="notice" @close="clearNotice" />
 
       <div v-if="showConfigModal" class="modal-overlay" @click.self="closeConfigModal">
         <div class="modal modal-xl">
@@ -929,82 +726,25 @@ function wifiDbmLabel(dbm) {
         </div>
       </div>
 
-      <div class="stats-grid">
-        <div class="stat-card online">
-          <div class="stat-icon" aria-hidden="true"><span class="stat-dot stat-dot-online"></span></div>
-          <div class="stat-info">
-            <div class="stat-value">{{ onlineCount }}</div>
-            <div class="stat-label">在线</div>
-          </div>
-        </div>
-        <div class="stat-card offline">
-          <div class="stat-icon" aria-hidden="true"><span class="stat-dot stat-dot-offline"></span></div>
-          <div class="stat-info">
-            <div class="stat-value">{{ offlineCount }}</div>
-            <div class="stat-label">离线</div>
-          </div>
-        </div>
-        <div class="stat-card total">
-          <div class="stat-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 2H7a2 2 0 00-2 2v16a2 2 0 002 2h10a2 2 0 002-2V4a2 2 0 00-2-2zm-5 19a1 1 0 110-2 1 1 0 010 2zm5-4H7V5h10v12z"/></svg>
-          </div>
-          <div class="stat-info">
-            <div class="stat-value">{{ devices.length }}</div>
-            <div class="stat-label">设备</div>
-          </div>
-        </div>
-        <div class="stat-card sim">
-          <div class="stat-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H9l-6 6v10a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2zm-2 14H7v-2h10v2zm0-4H7v-2h10v2zm0-4h-4V6h4v3z"/></svg>
-          </div>
-          <div class="stat-info">
-            <div class="stat-value">{{ numbers.length }}</div>
-            <div class="stat-label">SIM卡</div>
-          </div>
-        </div>
-      </div>
+      <StatsGrid
+        :online="onlineCount"
+        :offline="offlineCount"
+        :total="devicesStore.devicesTotal"
+        :sim-count="devicesStore.numbersTotal"
+      />
 
-      <div class="sms-section">
-        <div class="section-header">
-          <h2>消息发送</h2>
-          <div class="mode-tabs">
-            <button :class="['mode-tab', { active: commMode === 'sms' }]" @click="commMode = 'sms'">短信</button>
-            <button :class="['mode-tab', { active: commMode === 'dial' }]" @click="commMode = 'dial'">拨号</button>
-          </div>
-        </div>
-
-        <div v-show="commMode === 'sms'" class="form-grid">
-          <select v-model="fromSelected" class="form-select">
-            <option value="">选择发送卡号</option>
-            <option
-              v-for="n in numbers"
-              :key="String(n.deviceId) + '-' + String(n.slot)"
-              :value="String(n.deviceId) + '|' + String(n.slot)"
-            >
-              {{ n.number }} ({{ n.operator || '未知' }})
-            </option>
-          </select>
-          <input v-model="toPhone" class="form-input" placeholder="收件人号码" />
-          <textarea v-model="content" class="form-textarea" placeholder="短信内容..." rows="2"></textarea>
-          <button class="btn-send" :disabled="loading || !fromSelected || !toPhone || !content" @click="send">发送</button>
-        </div>
-
-        <div v-show="commMode === 'dial'" class="form-grid">
-          <select v-model="fromSelected" class="form-select">
-            <option value="">选择发送卡号</option>
-            <option
-              v-for="n in numbers"
-              :key="String(n.deviceId) + '-' + String(n.slot)"
-              :value="String(n.deviceId) + '|' + String(n.slot)"
-            >
-              {{ n.number }} ({{ n.operator || '未知' }})
-            </option>
-          </select>
-          <input v-model="dialPhone" class="form-input" placeholder="拨打的号码" />
-          <textarea v-model="ttsText" class="form-textarea" placeholder="TTS内容（可选）..." rows="2"></textarea>
-          <button class="btn-send" :disabled="loading || !fromSelected || !dialPhone" @click="dial">拨号</button>
-        </div>
-      </div>
+      <MessagePanel
+        v-model:mode="commMode"
+        v-model:sender="fromSelected"
+        v-model:to-phone="toPhone"
+        v-model:content="content"
+        v-model:dial-phone="dialPhone"
+        v-model:tts-text="ttsText"
+        :numbers="allNumbers"
+        :loading="loading"
+        @send="send"
+        @dial="dial"
+      />
 
       <div class="toolbar">
         <div class="toolbar-left">
@@ -1024,13 +764,13 @@ function wifiDbmLabel(dbm) {
 
       <div class="select-bar">
         <label class="select-all-label">
-          <span :class="['checkbox', { checked: selectedCount > 0 && selectedCount === filteredDevices.length }]">
-            {{ selectedCount > 0 && selectedCount === filteredDevices.length ? '✓' : (selectedCount > 0 ? '−' : '') }}
+          <span :class="['checkbox', { checked: currentPageSelectedCount > 0 && currentPageSelectedCount === filteredDevices.length }]">
+            {{ currentPageSelectedCount > 0 && currentPageSelectedCount === filteredDevices.length ? '✓' : (currentPageSelectedCount > 0 ? '−' : '') }}
           </span>
           <input
             type="checkbox"
-            :checked="selectedCount === filteredDevices.length && filteredDevices.length > 0"
-            :indeterminate="selectedCount > 0 && selectedCount < filteredDevices.length"
+            :checked="currentPageSelectedCount === filteredDevices.length && filteredDevices.length > 0"
+            :indeterminate="currentPageSelectedCount > 0 && currentPageSelectedCount < filteredDevices.length"
             @change="toggleSelectAll"
             style="display: none"
           />
@@ -1038,15 +778,15 @@ function wifiDbmLabel(dbm) {
             {{ selectedCount > 0 ? `已选择 ${selectedCount} 台` : '全选' }}
           </span>
         </label>
-        <button v-if="selectedCount > 0" class="batch-cancel" @click="selectedIds = []; selectAll = false">取消选择</button>
+        <button v-if="selectedCount > 0" class="batch-cancel" @click="selectedIds = []">取消选择</button>
       </div>
 
       <div class="tab-bar">
         <button :class="['tab-btn', { active: activeTab === 'devices' }]" @click="activeTab = 'devices'">
-          设备列表 ({{ filteredDevices.length }})
+          设备列表 ({{ devicesStore.devicesTotal }})
         </button>
         <button :class="['tab-btn', { active: activeTab === 'numbers' }]" @click="activeTab = 'numbers'">
-          号码列表 ({{ filteredNumbers.length }})
+          号码列表 ({{ devicesStore.numbersTotal }})
         </button>
       </div>
 
@@ -1122,6 +862,15 @@ function wifiDbmLabel(dbm) {
         </div>
       </div>
 
+      <Pagination
+        v-if="activeTab === 'devices'"
+        :page="devicesStore.devicesPage"
+        :pages="devicesStore.devicesPages"
+        :page-size="devicesStore.devicesPageSize"
+        :total="devicesStore.devicesTotal"
+        @change="devicesStore.setDevicesPage"
+      />
+
       <div v-if="activeTab === 'numbers'" class="numbers-table">
         <div v-if="filteredNumbers.length === 0" class="empty-state">
           <div class="empty-icon" aria-hidden="true">
@@ -1145,127 +894,53 @@ function wifiDbmLabel(dbm) {
             </tr>
           </tbody>
         </table>
+        <Pagination
+          :page="devicesStore.numbersPage"
+          :pages="devicesStore.numbersPages"
+          :page-size="devicesStore.numbersPageSize"
+          :total="devicesStore.numbersTotal"
+          @change="devicesStore.setNumbersPage"
+        />
       </div>
 
-      <div v-if="showWifiModal" class="modal-overlay" @click.self="closeWifiModal">
-        <div class="modal">
-          <div class="modal-header">
-            <h3>批量配置 WiFi</h3>
-            <button class="modal-close" @click="closeWifiModal">×</button>
-          </div>
-          <div class="modal-body">
-            <input v-model="wifiSsid" class="form-input" placeholder="WiFi 名称 (SSID)" />
-            <input v-model="wifiPwd" class="form-input" type="password" placeholder="WiFi 密码" autocomplete="off" />
-            
-            <!-- 预览结果区域 -->
-            <div v-if="wifiPreviewResults.length > 0" class="preview-section">
-              <h4>预览结果（不写入设备）：</h4>
-              <div class="preview-list">
-                <div v-for="result in wifiPreviewResults" :key="result.id" class="preview-item">
-                  <span class="preview-ip">{{ result.ip }}</span>
-                  <span class="preview-alias">{{ result.alias || '(无别名)' }}</span>
-                  <span class="preview-status">WiFi将改为: {{ result.new_wifi }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="closeWifiModal">取消</button>
-            <button class="btn-preview" @click="previewWifi" :disabled="loading">预览</button>
-            <button class="btn-confirm" @click="applyWifi" :disabled="loading">确认执行</button>
-          </div>
-        </div>
-      </div>
+      <WifiModal
+        v-if="showWifiModal"
+        v-model:ssid="wifiSsid"
+        v-model:password="wifiPwd"
+        :results="wifiPreviewResults"
+        :loading="loading"
+        @preview="previewWifi"
+        @apply="applyWifi"
+        @close="closeWifiModal"
+      />
 
-      <!-- OTA升级模态框 -->
-      <div v-if="showOtaModal" class="modal-overlay" @click.self="closeOtaModal">
-        <div class="modal modal-lg">
-          <div class="modal-header">
-            <h3>批量 OTA 升级</h3>
-            <button class="modal-close" @click="closeOtaModal">×</button>
-          </div>
-          <div class="modal-body">
-            <!-- 添加检查版本按钮 -->
-            <div v-if="otaResults.length === 0" class="ota-check-section">
-              <p>点击按钮检查选中设备的版本信息</p>
-              <button class="btn-check" @click="checkOta" :disabled="loading">
-                {{ loading ? '正在检查...' : '检查版本' }}
-              </button>
-            </div>
-            
-            <div v-if="loading && otaResults.length === 0" class="ota-loading">
-              <p>正在检查版本...</p>
-            </div>
-            <div v-else-if="otaResults.length > 0" class="ota-results">
-              <div class="ota-summary">
-                <span class="ota-updatable">{{ otaResults.filter(r => r.ok && r.hasUpdate).length }} 台可升级</span>
-                <span class="ota-latest">{{ otaResults.filter(r => r.ok && !r.hasUpdate).length }} 台已是最新</span>
-                <span class="ota-failed">{{ otaResults.filter(r => !r.ok).length }} 台检查失败</span>
-              </div>
-              <div class="ota-list">
-                <div v-for="r in otaResults" :key="r.id" class="ota-item" :class="{ 'has-update': r.ok && r.hasUpdate, 'failed': !r.ok }">
-                  <div class="ota-ip">{{ r.ip }}</div>
-                  <div class="ota-version">
-                    <span v-if="r.ok && r.hasUpdate">
-                      <span class="version-current">{{ r.currentVer || '-' }}</span>
-                      <span class="version-arrow">→</span>
-                      <span class="version-new">{{ r.newVer }}</span>
-                    </span>
-                    <span v-else-if="r.ok">已是最新: {{ r.currentVer || '-' }}</span>
-                    <span v-else class="version-error">{{ r.error || '检查失败' }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="closeOtaModal">关闭</button>
-            <button class="btn-upgrade" @click="upgradeOta" :disabled="loading || otaUpgrading || !otaResults.filter(r => r.ok && r.hasUpdate).length">
-              {{ otaUpgrading ? '升级中...' : '升级' }}
-            </button>
-          </div>
-        </div>
-      </div>
+      <OtaModal
+        v-if="showOtaModal"
+        :results="otaResults"
+        :loading="loading"
+        :upgrading="otaUpgrading"
+        @check="checkOta"
+        @upgrade="upgradeOta"
+        @close="closeOtaModal"
+      />
 
-      <div v-if="showDetailModal && deviceDetail" class="modal-overlay" @click.self="closeDetailModal">
-        <div class="modal">
-          <div class="modal-header">
-            <h3>📋 设备详情</h3>
-            <button class="modal-close" @click="closeDetailModal">×</button>
-          </div>
-          <div class="modal-body">
-            <div class="detail-grid">
-              <div class="detail-item"><span class="detail-label">设备ID</span><span>{{ deviceDetail.device && deviceDetail.device.devId || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">别名</span><span>{{ deviceDetail.device && deviceDetail.device.alias || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">IP 地址</span><span class="mono">{{ deviceDetail.device && deviceDetail.device.ip }}</span></div>
-              <div class="detail-item"><span class="detail-label">MAC 地址</span><span class="mono">{{ deviceDetail.device && deviceDetail.device.mac || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">分组</span><span>{{ deviceDetail.device && deviceDetail.device.grp || 'auto' }}</span></div>
-              <div class="detail-item">
-                <span class="detail-label">状态</span>
-                <span :class="['status-badge', deviceDetail.device && deviceDetail.device.status]">
-                  {{ deviceDetail.device && deviceDetail.device.status === 'online' ? '在线' : '离线' }}
-                </span>
-              </div>
-              <div class="detail-item"><span class="detail-label">SIM1 号码</span><span class="mono">{{ deviceDetail.device && deviceDetail.device.sim1number || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">SIM1 运营商</span><span>{{ deviceDetail.device && deviceDetail.device.sim1operator || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">SIM2 号码</span><span class="mono">{{ deviceDetail.device && deviceDetail.device.sim2number || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">SIM2 运营商</span><span>{{ deviceDetail.device && deviceDetail.device.sim2operator || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">WiFi 名称</span><span>{{ deviceDetail.device && deviceDetail.device.wifiName || '-' }}</span></div>
-              <div class="detail-item"><span class="detail-label">信号强度</span><span :style="{ color: wifiDbmColor(deviceDetail.device && deviceDetail.device.wifiDbm) }">{{ wifiDbmLabel(deviceDetail.device && deviceDetail.device.wifiDbm) }}</span></div>
-            </div>
-            <div class="sim-edit-section">
-              <p class="sim-edit-title">编辑 SIM 卡号</p>
-              <input v-model="deviceDetail.device.sim1number" class="form-input" placeholder="SIM1 号码" />
-              <input v-model="deviceDetail.device.sim2number" class="form-input" placeholder="SIM2 号码" />
-              <button class="btn-confirm" @click="saveSimSingle" :disabled="loading">保存卡号</button>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="closeDetailModal">关闭</button>
-          </div>
-        </div>
-      </div>
+      <DetailModal
+        v-if="showDetailModal && deviceDetail"
+        :detail="deviceDetail"
+        :loading="loading"
+        @update-sim1="updateDetailSim('sim1number', $event)"
+        @update-sim2="updateDetailSim('sim2number', $event)"
+        @save="saveSimSingle"
+        @close="closeDetailModal"
+      />
     </div>
+
+    <!-- FIX(P2#6): app-wide singletons that replace native window.prompt
+         and window.confirm. Only ever one of each open at a time, so
+         mounting them at the App root keeps the dialog store usable
+         from anywhere (LoginView too, when authed === false). -->
+    <ConfirmModal />
+    <PromptModal />
   </div>
 </template>
 
@@ -1365,6 +1040,7 @@ body {
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .form-grid .form-select,
 .form-grid .form-input { background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-size: 14px; outline: none; }
+.form-grid .form-select option { background: #1c1c1e; color: #ffffff; }
 .form-grid .form-textarea { grid-column: span 2; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-size: 14px; resize: vertical; outline: none; }
 .form-grid .btn-send { grid-column: span 2; background: var(--primary); border: none; color: white; padding: 12px; border-radius: 8px; cursor: pointer; font-weight: 500; }
 .form-grid .btn-send:hover:not(:disabled) { background: var(--primary-dark); }
@@ -1381,7 +1057,6 @@ body {
 .toolbar-btn.danger { color: var(--danger); }
 .toolbar-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.batch-bar { background: var(--primary); color: white; padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
 .batch-cancel { background: rgba(255,255,255,0.2); border: none; color: white; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
 
 .select-bar { background: var(--bg-card); padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--border); }
@@ -1449,13 +1124,12 @@ body {
 .modal-header h3 { font-size: 17px; font-weight: 600; }
 .modal-close { background: none; border: none; color: var(--text-secondary); font-size: 24px; cursor: pointer; }
 .modal-body { padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+.modal-hint { color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .modal-footer { display: flex; gap: 12px; padding: 16px 20px; border-top: 1px solid var(--border); }
 
-.form-input, .form-select-full, .form-textarea-full { width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 11px 14px; color: var(--text-primary); font-size: 14px; outline: none; }
-.form-input:focus, .form-select-full:focus, .form-textarea-full:focus { border-color: var(--primary); }
+.form-input, .form-textarea-full { width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 11px 14px; color: var(--text-primary); font-size: 14px; outline: none; }
+.form-input:focus, .form-textarea-full:focus { border-color: var(--primary); }
 .form-textarea-full { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.45; }
-.form-group { display: flex; flex-direction: column; gap: 6px; }
-.form-label { font-size: 13px; color: var(--text-secondary); }
 .config-section { display: flex; flex-direction: column; gap: 8px; }
 .config-intro, .config-flow { display: flex; flex-direction: column; gap: 12px; }
 .config-info, .config-hint { color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
@@ -1498,9 +1172,6 @@ body {
 .btn-check:hover:not(:disabled) { background: var(--primary-dark); }
 .btn-check:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.btn-refresh { background: var(--bg-dark); border: 1px solid var(--border); color: var(--text-primary); padding: 11px; border-radius: 8px; cursor: pointer; }
-.btn-refresh:hover:not(:disabled) { background: var(--bg-card-hover); }
-.btn-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-upgrade { background: var(--success); border: none; color: white; padding: 11px; border-radius: 8px; font-weight: 500; cursor: pointer; }
 .btn-upgrade:hover:not(:disabled) { background: #0d9668; }
 .btn-upgrade:disabled { opacity: 0.5; cursor: not-allowed; }
