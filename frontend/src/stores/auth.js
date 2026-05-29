@@ -44,7 +44,7 @@ export const useAuthStore = defineStore('auth', () => {
     notice.clear()
     try {
       const data = await loginApi(password)
-      saveAuth(data.token, data.expiresIn || 28800)
+      // FIX: cookie is set by server, no need to save token locally
       authed.value = true
       uiPass.value = ''
       notice.set('登录成功', 'ok')
