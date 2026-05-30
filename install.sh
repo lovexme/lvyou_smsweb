@@ -204,7 +204,28 @@ install_backend() {
   "${APPDIR}/venv/bin/pip" install --upgrade pip
   "${APPDIR}/venv/bin/pip" install -r "${ROOT_DIR}/backend/requirements.txt"
 
-  cp "${ROOT_DIR}/backend/main.py" "${APPDIR}/app/main.py"
+  # FIX(P1): deploy full backend package so routes can import from
+  # backend.config / backend.db / backend.security / backend.main.
+  mkdir -p "${APPDIR}/app/backend/routes"
+  cp "${ROOT_DIR}/backend/main.py" "${APPDIR}/app/backend/main.py"
+  cp "${ROOT_DIR}/backend/config.py" "${APPDIR}/app/backend/config.py"
+  cp "${ROOT_DIR}/backend/db.py" "${APPDIR}/app/backend/db.py"
+  cp "${ROOT_DIR}/backend/security.py" "${APPDIR}/app/backend/security.py"
+  touch "${APPDIR}/app/backend/__init__.py"
+  if [[ -f "${ROOT_DIR}/backend/routes/__init__.py" ]]; then
+    cp "${ROOT_DIR}/backend/routes/__init__.py" "${APPDIR}/app/backend/routes/__init__.py"
+  else
+    touch "${APPDIR}/app/backend/routes/__init__.py"
+  fi
+  for f in auth.py devices.py scan.py config.py; do
+    [[ -f "${ROOT_DIR}/backend/routes/$f" ]] && cp "${ROOT_DIR}/backend/routes/$f" "${APPDIR}/app/backend/routes/$f"
+  done
+  # Thin entry point so uvicorn finds main:app at the top level.
+  cat > "${APPDIR}/app/main.py" << 'ENTRY'
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from backend.main import app
+ENTRY
 }
 
 install_frontend() {
