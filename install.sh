@@ -252,6 +252,12 @@ render_service() {
   local template="$1"
   local output="$2"
 
+  # 构建 UIPASS 行：为空时不写入，让 config.py 默认值 "admin" 生效
+  local uipass_line=""
+  if [[ -n "${UIPASS}" ]]; then
+    uipass_line="Environment=BMUIPASS=${UIPASS}"
+  fi
+
   sed \
     -e "s|{{APPDIR}}|${APPDIR}|g" \
     -e "s|{{APIPORT}}|${APIPORT}|g" \
@@ -259,6 +265,11 @@ render_service() {
     -e "s|{{SCANPASS}}|${SCANPASS}|g" \
     -e "s|{{UIPASS}}|${UIPASS}|g" \
     "${template}" > "${output}"
+
+  # 如果 UIPASS 为空，删除模板中的 BMUIPASS 行
+  if [[ -z "${UIPASS}" ]]; then
+    sed -i '/^Environment=BMUIPASS=$/d' "${output}"
+  fi
 }
 
 show_service_failure_logs() {
