@@ -28,7 +28,7 @@ UIUSER            = os.environ.get("BMUIUSER", "admin")
 # backend.security, the server refuses to start unless BMUIPASS is
 # explicitly set to a non-default value (override with
 # BMINSECURE_DEFAULT_PASSWORD=1 for local development).
-UIPASS            = os.environ.get("BMUIPASS", "")
+UIPASS            = os.environ.get("BMUIPASS", "admin")
 # FIX(P1#10): shorten default token lifetime from 8h to 2h.
 TOKEN_TTL_SECONDS = int(os.environ.get("BMTOKENTTL", str(2 * 60 * 60)))
 

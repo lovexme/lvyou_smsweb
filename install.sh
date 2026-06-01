@@ -151,7 +151,12 @@ prompt_ui_pass() {
   fi
 
   while true; do
-    read_tty "请设置 UI 登录密码(至少6位): " pass1
+    read_tty "请设置 UI 登录密码(回车使用默认 admin，至少6位): " pass1
+    if [[ -z "${pass1}" ]]; then
+      UIPASS="admin"
+      log_warn "使用默认密码 'admin'，建议后续通过 'lvyou pass' 更换强密码"
+      break
+    fi
     if [[ ${#pass1} -lt 6 ]]; then
       log_err "密码至少 6 位"
       continue

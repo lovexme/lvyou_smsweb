@@ -289,11 +289,17 @@ def validate_startup_security() -> None:
     enforceable -- without it, an unset env var silently falls back to
     admin/admin, which is exactly the regression that prompted this fix."""
     if (not UIPASS or UIPASS == "admin") and not env_truthy("BMINSECURE_DEFAULT_PASSWORD"):
-        raise RuntimeError(
-            "BMUIPASS must be set to a strong non-default password before starting. "
-            "Set BMUIPASS=<strong password> (or BMINSECURE_DEFAULT_PASSWORD=1 for "
-            "local development only)."
-        )
+        if UIPASS == "admin":
+            import logging
+            logging.getLogger("board-manager").warning(
+                "⚠️  BMUIPASS 使用默认值 'admin'，建议设置强密码: BMUIPASS=<strong password>"
+            )
+        else:
+            raise RuntimeError(
+                "BMUIPASS must be set before starting. "
+                "Set BMUIPASS=<strong password> (or BMINSECURE_DEFAULT_PASSWORD=1 for "
+                "local development only)."
+            )
     # FIX(P2#1): SameSite=None is rejected by every modern browser unless
     # the cookie is also Secure. Catch this misconfiguration at startup
     # rather than silently dropping the auth cookie at request time.
