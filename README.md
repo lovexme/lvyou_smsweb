@@ -1,4 +1,4 @@
-# 绿邮X系列内网群控系统 v5.1
+# 绿邮X系列内网群控系统 v5.2
 
 一个用于管理局域网内智能设备（如短信转发设备）的 Web 管理平台，支持设备扫描、短信发送、电话拨号、批量配置、OTA 升级等功能。
 
@@ -127,6 +127,10 @@ BMUIPASS=your_strong_password python -m uvicorn main:app --host :: --port 8000 &
 │   ├── config.py        # 环境变量配置
 │   ├── db.py            # SQLAlchemy 模型、Token CRUD
 │   ├── security.py      # SSRF 防护、IP 校验、网络工具
+│   ├── audit.py         # 结构化 JSON 审计日志
+│   ├── ratelimit.py     # SQLite 持久化限流器
+│   ├── http_client.py   # httpx 连接池 + 线程池管理
+│   ├── device_client.py # 设备通信（token/配置/OTA/WiFi）
 │   ├── routes/
 │   │   ├── auth.py      # 登录/登出/健康检查
 │   │   ├── devices.py   # 设备 CRUD/SMS/WiFi/SIM/Forward/OTA
@@ -135,11 +139,13 @@ BMUIPASS=your_strong_password python -m uvicorn main:app --host :: --port 8000 &
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── App.vue      # 主应用组件
-│   │   ├── api/         # axios 封装
-│   │   ├── components/  # Vue 组件
-│   │   ├── stores/      # Pinia 状态管理
-│   │   └── utils/       # 工具函数
+│   │   ├── App.vue          # 主应用（布局组装层）
+│   │   ├── api/             # axios 封装
+│   │   ├── components/      # Vue 组件
+│   │   ├── composables/     # 组合式函数（业务逻辑）
+│   │   ├── stores/          # Pinia 状态管理
+│   │   ├── styles/          # 样式文件
+│   │   └── utils/           # 工具函数
 │   └── package.json
 ├── docker-entrypoint.sh # Docker 入口脚本
 ├── Dockerfile

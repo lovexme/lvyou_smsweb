@@ -1,5 +1,39 @@
 # 修复清单（基线：lvyou_smsweb_3 zip）
 
+## 重构：v5.2.0 模块化拆分 (2026-06-01)
+
+### 后端模块拆分
+
+从 `main.py` 拆出 4 个独立模块：
+
+| 新模块 | 行数 | 职责 |
+|--------|------|------|
+| `backend/audit.py` | 116 | 结构化 JSON 审计日志，RotatingFileHandler 轮转 |
+| `backend/ratelimit.py` | 63 | SQLite 持久化限流器，v4/v6 共享状态 |
+| `backend/http_client.py` | 69 | httpx 连接池 + ThreadPoolExecutor 生命周期管理 |
+| `backend/device_client.py` | 285 | 设备 token/配置/OTA/WiFi/SSRF 校验 |
+
+`main.py` 变为纯入口 + 中间件 + 生命周期管理，通过 import 保持原有调用链不变。
+
+### 前端 Composables 拆分
+
+| Composable | 职责 |
+|------------|------|
+| `useLoading.js` | 全局加载状态 |
+| `useNotice.js` | 通知消息管理 |
+| `useDeviceActions.js` | 设备操作（删除/扫描/分组/改名） |
+| `useMessaging.js` | 短信发送 + 电话拨号 |
+| `useWifi.js` | WiFi 批量配置 |
+| `useOta.js` | OTA 批量升级 |
+| `useConfigBatch.js` | 批量配置（转发/SIM/正则替换） |
+| `useDetail.js` | 设备详情 Modal |
+
+新增组件：`ConfigModal.vue`、`DeviceGrid.vue`、`NumbersTable.vue`
+
+---
+
+## 修复清单（基线：lvyou_smsweb_3 zip，以下为历史记录）
+
 排除项：弱默认凭据 / 明文密码比较 / `BMUIPASS=admin` 默认值 — 按要求未改动。
 
 ## 必修级（升级 / 部署阻断问题）

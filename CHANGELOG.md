@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-06-01
+
+### Added
+- **审计日志模块**：`backend/audit.py` — 结构化 JSON 审计日志，支持文件轮转，可对接 Loki/ELK/Datadog
+- **持久化限流器**：`backend/ratelimit.py` — SQLite 持久化限流，v4/v6 双进程共享同一计数器，重启不丢状态
+- **HTTP 客户端模块**：`backend/http_client.py` — httpx 连接池 + ThreadPoolExecutor 统一生命周期管理
+- **设备通信模块**：`backend/device_client.py` — 设备 token/配置/OTA/WiFi 操作抽为独立模块
+- **前端 Composables**：`frontend/src/composables/` — useLoading/useNotice/useDeviceActions/useMessaging/useWifi/useOta/useConfigBatch/useDetail
+- **前端新组件**：`ConfigModal.vue`、`DeviceGrid.vue`、`NumbersTable.vue`
+- **独立样式文件**：`frontend/src/styles/app.css`
+
+### Changed
+- **main.py 瘦身**：从大杂烩重构为纯入口 + 中间件 + 生命周期管理，业务逻辑拆入 4 个独立模块
+- **App.vue 瘦身**：业务逻辑拆入 composables，App.vue 仅保留布局组装
+- **限流器改进**：从内存 dict 改为 SQLite 持久化，支持 v4/v6 双进程共享
+- **RateLimiter 接口变更**：构造函数新增 `scope` 参数用于事件命名空间隔离
+
 ## [5.1.0] - 2026-05-29
 
 ### Added

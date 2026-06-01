@@ -42,7 +42,7 @@ RUN pnpm run build
 # ---- 阶段2：最终运行镜像 ----
 FROM python:3.11-slim
 
-ARG VERSION="5.0"
+ARG VERSION="5.2"
 
 LABEL maintainer="lovexme"
 LABEL description="绿邮X系列内网群控系统"
