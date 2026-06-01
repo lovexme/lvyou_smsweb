@@ -1,32 +1,20 @@
 import asyncio
-import json
 import os
 import re
-import threading
-import time
 from datetime import datetime
-from ipaddress import ip_address, ip_network, IPv4Network
-from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-import concurrent.futures
 import hashlib
 import hmac
 import logging
 import uuid as _uuid
-from collections import defaultdict
-from logging.handlers import RotatingFileHandler
-from threading import Lock as _Lock
 
 # FIX(P2#4): leaf modules (config / db / security) own the SQLAlchemy
 # engine, models, token CRUD, SSRF allowlist and network helpers. Routes
@@ -74,8 +62,34 @@ from backend.security import (
     prewarm_neighbors,
     tcp_port_open as _tcp_port_open,
     validate_startup_security as _validate_startup_security,
-    set_shared_executor as _set_shared_executor,
 )
+# FIX(P2#4 refactor): shared HTTP client/executor, audit logger, rate limiter
+# and device-communication primitives now live in dedicated modules. main.py
+# re-imports them under their original names so the route-module dependency
+# injection and the lazy `from backend.main import ...` call sites are
+# unchanged.
+from backend.http_client import (
+    get_sync_client as _get_sync_client,
+    get_shared_executor as _get_shared_executor,
+    init_runtime as _init_runtime,
+    shutdown_runtime as _shutdown_runtime,
+)
+from backend.audit import audit as _audit
+from backend.ratelimit import RateLimiter, max_period_seen as _rate_max_period
+from backend.device_client import (
+    ensure_device_ip_allowed as _ensure_device_ip_allowed,
+    istargetdevice,
+    getdevicedata,
+    get_wifi_info,
+    read_device_config,
+    write_device_config,
+    ota_check as _ota_check,
+    check_ota_task,
+    upgrade_ota_task,
+    ensure_device_token,
+    fetch_device_token,
+)
+from backend.db import cleanup_rate_events as _cleanup_rate_events
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("board-manager")
@@ -97,79 +111,28 @@ logger.setLevel(logging.DEBUG if _env_truthy("BMDEBUG") else logging.INFO)
 # module reads identically.
 
 
-class RateLimiter:
-    def __init__(self, max_calls: int, period: float):
-        self._max    = max_calls
-        self._period = period
-        self._hits: Dict[str, list] = defaultdict(list)
-        self._lock   = _Lock()
-
-    def _prune_locked(self, key: str, now: float) -> list:
-        window = [t for t in self._hits.get(key, []) if now - t < self._period]
-        self._hits[key] = window
-        return window
-
-    def allow(self, key: str) -> bool:
-        """Check the limit and record this attempt atomically."""
-        now = time.time()
-        with self._lock:
-            window = self._prune_locked(key, now)
-            if len(window) >= self._max:
-                return False
-            window.append(now)
-            return True
-
-    def check_only(self, key: str) -> bool:
-        """FIX(P2#2): non-recording probe. Used by the login flow to gate
-        before validating credentials so a flood of well-formed login
-        requests does not consume the budget for legitimate users."""
-        now = time.time()
-        with self._lock:
-            return len(self._prune_locked(key, now)) < self._max
-
-    def record(self, key: str) -> None:
-        """FIX(P2#2): record an event without a guard check. Paired with
-        check_only() the caller can implement count-failures-only
-        semantics: fat-fingering a password and then succeeding does not
-        eat the budget, but failed attempts do."""
-        now = time.time()
-        with self._lock:
-            window = self._prune_locked(key, now)
-            window.append(now)
-
-    def reset(self, key: str) -> None:
-        """FIX(P2#2): clear the failure window after a successful login."""
-        with self._lock:
-            self._hits.pop(key, None)
-
-    def remaining(self, key: str) -> int:
-        now = time.time()
-        with self._lock:
-            window = [t for t in self._hits.get(key, []) if now - t < self._period]
-            return max(0, self._max - len(window))
-
-
-_sms_limiter  = RateLimiter(int(os.environ.get("BMSMSRATELIMIT",  "10")), float(os.environ.get("BMSMSRATEPERIOD",  "60")))
-_dial_limiter = RateLimiter(int(os.environ.get("BMDIALRATELIMIT",  "5")), float(os.environ.get("BMDIALRATEPERIOD", "60")))
+# FIX(M3/H2 refactor): RateLimiter now lives in backend.ratelimit and is backed
+# by SQLite so the v4 + v6 processes share one budget and idle keys do not leak
+# memory. Each instance carries a scope string used as the event namespace.
+_sms_limiter  = RateLimiter("sms",  int(os.environ.get("BMSMSRATELIMIT",  "10")), float(os.environ.get("BMSMSRATEPERIOD",  "60")))
+_dial_limiter = RateLimiter("dial", int(os.environ.get("BMDIALRATELIMIT",  "5")), float(os.environ.get("BMDIALRATEPERIOD", "60")))
 # FIX(P2#2): two-dimensional login rate limit. The IP limiter catches one
 # attacker probing many usernames; the username limiter catches a
 # distributed bruteforce of a single known account from many addresses.
 # Both are count-failures-only so legitimate users with one or two typos
-# are not locked out alongside attackers. Defaults stay at 5 failures /
-# 60s for IP (preserves the previous BMLOGINRATELIMIT/PERIOD knobs) and
-# 10 / 600 for username (looser but with a much wider window so a slow
-# distributed attack still hits the cap before exhausting the password
-# space).
+# are not locked out alongside attackers.
 _login_limiter_ip = RateLimiter(
+    "login_ip",
     int(os.environ.get("BMLOGINRATELIMIT", "5")),
     float(os.environ.get("BMLOGINRATEPERIOD", "60")),
 )
 _login_limiter_user = RateLimiter(
+    "login_user",
     int(os.environ.get("BMLOGINUSERRATELIMIT", "10")),
     float(os.environ.get("BMLOGINUSERRATEPERIOD", "600")),
 )
 # FIX(N5): OTA batch rate limiter (per user), prevents using it as an internal reboot-storm
-_ota_limiter  = RateLimiter(int(os.environ.get("BMOTARATELIMIT",  "4")), float(os.environ.get("BMOTARATEPERIOD",  "60")))
+_ota_limiter  = RateLimiter("ota", int(os.environ.get("BMOTARATELIMIT",  "4")), float(os.environ.get("BMOTARATEPERIOD",  "60")))
 
 PHONE_RE = re.compile(r"^\+?[0-9]{5,15}$")
 
@@ -190,107 +153,8 @@ def _validate_sms_content(content: str) -> str:
     return c
 
 
-# FIX(P2#3): file-backed structured audit log with size-based rotation.
-# Defaults colocate audit.log next to the SQLite DB so the systemd unit's
-# existing ReadWritePaths covers it without further changes; operators
-# can redirect via BMAUDITLOGFILE (e.g. to /var/log/board-manager/) or
-# disable file logging entirely with BMAUDITLOGDISABLE=1 (e.g. inside a
-# container where stdout shipping is preferred).
-_audit_default_dir = os.path.dirname(DBPATH) or "/var/log/board-manager"
-AUDIT_LOG_FILE         = os.environ.get("BMAUDITLOGFILE", os.path.join(_audit_default_dir, "audit.log"))
-AUDIT_LOG_MAX_BYTES    = int(os.environ.get("BMAUDITLOGMAXBYTES",    str(10 * 1024 * 1024)))
-AUDIT_LOG_BACKUP_COUNT = int(os.environ.get("BMAUDITLOGBACKUPCOUNT", "5"))
-AUDIT_LOG_DISABLE      = os.environ.get("BMAUDITLOGDISABLE", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-class _JsonAuditFormatter(logging.Formatter):
-    """FIX(P2#3): emit one JSON object per line so log shippers (Loki,
-    ELK, Datadog, journald JSON parser) can index fields without the
-    fragile `key=value` regex parsing the legacy text format required."""
-
-    def format(self, record):
-        ts = datetime.utcfromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        payload = {
-            "ts":     ts,
-            "level":  record.levelname,
-            "action": getattr(record, "audit_action", record.getMessage()),
-            "user":   getattr(record, "audit_user", "-"),
-            "detail": getattr(record, "audit_detail", ""),
-        }
-        ip = getattr(record, "audit_ip", "")
-        if ip:
-            payload["ip"] = ip
-        result = getattr(record, "audit_result", "")
-        if result:
-            payload["result"] = result
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-def _setup_audit_logger() -> logging.Logger:
-    """FIX(P2#3): configure the audit logger with two sinks: (a) a stream
-    handler so journalctl still shows recent activity, and (b) a rotating
-    file handler with the JSON formatter so the audit trail survives
-    journal rotation and can be shipped externally. The function is
-    idempotent so repeated imports (eg. pytest collection) don't pile up
-    duplicate handlers."""
-
-    aud = logging.getLogger("audit")
-    aud.setLevel(logging.INFO)
-    aud.propagate = False  # don't double-emit through the root logger
-    if aud.handlers:
-        return aud
-
-    stream = logging.StreamHandler()
-    # FIX(P2#3): include ip + result so the journal-readable form does
-    # not drop the structured fields the JSON formatter persists.
-    stream.setFormatter(logging.Formatter(
-        "audit ts=%(asctime)s action=%(audit_action)s user=%(audit_user)s "
-        "ip=%(audit_ip)s result=%(audit_result)s detail=%(audit_detail)s"
-    ))
-    aud.addHandler(stream)
-
-    if AUDIT_LOG_DISABLE:
-        return aud
-
-    try:
-        log_dir = os.path.dirname(AUDIT_LOG_FILE)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        fh = RotatingFileHandler(
-            AUDIT_LOG_FILE,
-            maxBytes=AUDIT_LOG_MAX_BYTES,
-            backupCount=AUDIT_LOG_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-        fh.setFormatter(_JsonAuditFormatter())
-        aud.addHandler(fh)
-    except OSError as exc:
-        # Don't fail startup just because the audit dir isn't writable;
-        # the stream handler keeps records visible and the warning lands
-        # in the operator's main service log.
-        logger.warning("audit file logger disabled (%s): %s", AUDIT_LOG_FILE, exc)
-    return aud
-
-
-_audit_logger = _setup_audit_logger()
-
-
-def _audit(action: str, user: str = "-", detail: str = "", ip: str = "", result: str = ""):
-    """FIX(P2#3): all audit call sites now flow through structured fields
-    (`extra=...`) instead of being baked into the message string. The
-    JSON formatter consumes those fields directly; the legacy stream
-    formatter renders them as the old `key=value` shape so existing
-    journal greps keep working during the transition."""
-    _audit_logger.info(
-        action,
-        extra={
-            "audit_action": action,
-            "audit_user":   user,
-            "audit_detail": detail,
-            "audit_ip":     ip,
-            "audit_result": result,
-        },
-    )
+# FIX(P2#3 / P2#4 refactor): the structured audit logger (JSON file sink +
+# rotation) now lives in backend.audit; `_audit` is re-imported above.
 
 
 # FIX(P1#16): only swallow truly unhandled Exceptions. HTTPExceptions
@@ -306,75 +170,13 @@ def _setup_exception_handlers(_app: FastAPI):
         return JSONResponse(status_code=500, content={"detail": f"服务器内部错误 (ref: {err_id})"})
 
 
-class ScanState:
-    def __init__(self):
-        self.status    = "pending"
-        self.progress  = ""
-        self.results: List[Dict[str, Any]] = []
-        self.found     = 0
-        self.scanned   = 0
-        self.total_ips = 0
-        self.cidr      = ""
-        self.finished_at: float = 0.0
-        self._lock     = _Lock()
-
-    # FIX(P1#7): all mutators serialised under the same lock used by to_dict
-    def set_status(self, status: str, progress: Optional[str] = None) -> None:
-        with self._lock:
-            self.status = status
-            if progress is not None:
-                self.progress = progress
-
-    def set_progress(self, progress: str) -> None:
-        with self._lock:
-            self.progress = progress
-
-    def set_counts(self, *, scanned: Optional[int] = None, found: Optional[int] = None, total_ips: Optional[int] = None) -> None:
-        with self._lock:
-            if scanned is not None:
-                self.scanned = scanned
-            if found is not None:
-                self.found = found
-            if total_ips is not None:
-                self.total_ips = total_ips
-
-    def set_results(self, results: List[Dict[str, Any]]) -> None:
-        with self._lock:
-            self.results = results
-            self.found = len(results)
-
-    def set_cidr(self, cidr: str) -> None:
-        with self._lock:
-            self.cidr = cidr
-
-    def mark_done(self) -> None:
-        with self._lock:
-            self.finished_at = time.time()
-
-    def to_dict(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "status":    self.status,
-                "progress":  self.progress,
-                "found":     self.found,
-                "scanned":   self.scanned,
-                "total_ips": self.total_ips,
-                "cidr":      self.cidr,
-                "devices":   [{"ip": r["ip"], "devId": r.get("devId", "")} for r in self.results],
-            }
-
-
-_active_scans: Dict[str, ScanState] = {}
-_active_scans_lock = _Lock()
-
-
-def _cleanup_old_scans() -> None:
-    now = time.time()
-    with _active_scans_lock:
-        expired = [sid for sid, st in _active_scans.items()
-                   if st.finished_at > 0 and now - st.finished_at > SCAN_TTL]
-        for sid in expired:
-            _active_scans.pop(sid, None)
+# NOTE: the live scan state (ScanState class, the ``_active_scans``
+# registry and the TTL-based cleanup) lives in backend.routes.scan, which
+# is where scans are actually created and served. This module used to
+# carry an identical-but-unused copy; the periodic cleanup loop below
+# cleaned *that* dead dict while finished scans piled up in the route
+# module's registry. The duplicate has been removed and the loop now
+# calls the scan router's cleanup (see _scan_cleanup_loop).
 
 
 # ``_run_migrations`` runs at import time inside backend.db; ``get_db``,
@@ -470,37 +272,51 @@ def _check_login_credentials(username: str, password: str) -> bool:
 # now also lives in ``backend.security.validate_startup_security``.
 
 
-# ── Shared httpx client + executor (managed by lifespan) ─────────────────────
-_sync_client: Optional[httpx.Client] = None
-_shared_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_cleanup_task: Optional[asyncio.Task] = None
+# ── Background cleanup ───────────────────────────────────────────────────────
+# The shared httpx client + executor are owned by backend.http_client and
+# re-imported above as _get_sync_client / _get_shared_executor / _init_runtime.
+_cleanup_task: Optional["asyncio.Task"] = None
+
+# FIX(M4): __stale_<id>_<ts> ghost rows are created when a DHCP lease moves an IP
+# onto a device that already exists under another identity -- the old row's ip is
+# renamed to free the UNIQUE slot. Drop those orphans once they have not been
+# seen for STALE_DEVICE_TTL seconds (default 7 days) so they don't pile up.
+STALE_DEVICE_TTL = int(os.environ.get("BMSTALEDEVICETTL", str(7 * 86400)))
 
 
-def _get_sync_client() -> httpx.Client:
-    """Return the shared sync client; fall back to creating a fresh one if the
-    lifespan manager has not run yet (e.g. during tests)."""
-    global _sync_client
-    if _sync_client is None:
-        _sync_client = httpx.Client(
-            timeout=TIMEOUT,
-            limits=httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=20),
-            follow_redirects=False,
+def _cleanup_stale_devices() -> None:
+    db = SessionLocal()
+    try:
+        cutoff = nowts() - STALE_DEVICE_TTL
+        deleted = (
+            db.query(Device)
+            .filter(Device.ip.like("__stale\\_%", escape="\\"), Device.lastSeen < cutoff)
+            .delete(synchronize_session=False)
         )
-    return _sync_client
-
-
-def _get_shared_executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _shared_executor
-    if _shared_executor is None:
-        _shared_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(CONCURRENCY, 32))
-    return _shared_executor
+        if deleted:
+            db.commit()
+            logger.info("cleaned %d stale device rows", deleted)
+        else:
+            db.rollback()
+    except Exception:
+        db.rollback()
+        logger.debug("stale device cleanup failed", exc_info=True)
+    finally:
+        db.close()
 
 
 async def _scan_cleanup_loop() -> None:
     while True:
         try:
+            # Clean the route module's real scan registry (imported lazily
+            # to avoid an import cycle at module load time).
+            from backend.routes.scan import cleanup_old_scans as _cleanup_old_scans
             _cleanup_old_scans()
             _cleanup_expired_tokens()
+            # FIX(H2/M3): prune rate-limit events past the widest window.
+            _cleanup_rate_events(int(_rate_max_period()))
+            # FIX(M4): prune orphaned __stale_ device rows.
+            _cleanup_stale_devices()
         except Exception:
             logger.debug("background cleanup error", exc_info=True)
         await asyncio.sleep(60)
@@ -508,25 +324,16 @@ async def _scan_cleanup_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _sync_client, _shared_executor, _cleanup_task
+    global _cleanup_task
     # FIX(P0#1): refuse to start with an unset / default BMUIPASS.
     _validate_startup_security()
-    # FIX(P1#9): one sync client for the whole process, connection pooled.
-    _sync_client = httpx.Client(
-        timeout=TIMEOUT,
-        limits=httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=20),
-        follow_redirects=False,
-    )
-    # FIX(P1#10): one ThreadPoolExecutor for all batch endpoints / scans.
-    _shared_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(CONCURRENCY, 32))
-    # Share the executor with security.prewarm_neighbors
-    _set_shared_executor(_shared_executor)
-    # FIX(P1#6): the previous AsyncClient on app.state was created but never
-    # used by any endpoint. Removed to avoid leaking connections at shutdown
-    # and to make it obvious which client is the production code path.
-    app.state.sync_http_client = _sync_client
-    app.state.executor = _shared_executor
-    # FIX(P1#12): periodic cleanup task for finished scan tasks and expired tokens.
+    # FIX(P1#9/P1#10/P2#4): the shared connection-pooled client + executor are
+    # created here and shared with security.prewarm_neighbors inside init_runtime.
+    sync_client, executor = _init_runtime()
+    app.state.sync_http_client = sync_client
+    app.state.executor = executor
+    # FIX(P1#12): periodic cleanup task for finished scans, expired tokens,
+    # rate-limit events and stale device rows.
     _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
     try:
         yield
@@ -537,17 +344,10 @@ async def lifespan(app: FastAPI):
                 await _cleanup_task
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            _sync_client.close()
-        except Exception:
-            pass
-        try:
-            _shared_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        _shutdown_runtime()
 
 
-app = FastAPI(title="Board LAN Hub", version="5.0", lifespan=lifespan)
+app = FastAPI(title="Board LAN Hub", version="5.1", lifespan=lifespan)
 _setup_exception_handlers(app)
 
 
@@ -725,139 +525,14 @@ def uiindex():
 
 
 # Network-level helpers (SSRF allowlist, ARP table, prewarm, TCP probe,
-# default CIDR guess) live in ``backend.security``; only the thin
-# HTTP-aware wrapper that converts allowlist failures into HTTPException
-# stays here so it can use FastAPI's exception machinery.
-def _ensure_device_ip_allowed(ip: str) -> None:
-    if not _is_device_ip_allowed(ip):
-        logger.warning("blocked outbound device request to non-whitelisted ip: %s", ip)
-        raise HTTPException(status_code=400, detail="设备 IP 不在允许的内网范围内")
-
-
+# default CIDR guess) live in ``backend.security``; the thin HTTP-aware
+# wrapper that converts allowlist failures into HTTPException
+# (_ensure_device_ip_allowed) and every device-communication primitive
+# (istargetdevice / getdevicedata / get_wifi_info / read_device_config /
+# write_device_config / OTA / token) now live in backend.device_client and
+# are re-imported above under their original names.
 def _bm_op_from_sta(sta: str) -> str:
     return (sta or "").strip()
-
-
-# FIX(P1#9): reuse shared httpx.Client instead of creating one per call.
-def istargetdevice(ip: str, user: str, pw: str) -> Tuple[bool, Optional[str]]:
-    _ensure_device_ip_allowed(ip)
-    url = f"http://{ip}/mgr"
-    last_realm: Optional[str] = None
-    client = _get_sync_client()
-    for attempt in range(max(1, SCAN_RETRIES)):
-        try:
-            resp = client.get(url)
-            if resp.status_code != 401:
-                raise RuntimeError(f"unexpected status {resp.status_code}")
-            header = resp.headers.get("www-authenticate", "")
-            if "Digest" not in header:
-                raise RuntimeError("digest auth missing")
-            match = re.search(r'realm="([^"]+)"', header)
-            realm = match.group(1) if match else None
-            last_realm = realm
-            if realm != "asyncesp":
-                return False, realm
-            resp2 = client.get(url, auth=httpx.DigestAuth(user, pw))
-            if resp2.status_code == 200:
-                return True, realm
-            raise RuntimeError(f"auth status {resp2.status_code}")
-        except Exception as _scan_exc:
-            if attempt < max(1, SCAN_RETRIES) - 1:
-                logger.debug("scan %s attempt %d failed: %s", ip, attempt + 1, _scan_exc)
-                time.sleep(max(0, SCAN_RETRY_SLEEP_MS) / 1000.0)
-    return False, last_realm
-
-
-def getdevicedata(ip: str, user: str, pw: str) -> Optional[Dict[str, Any]]:
-    _ensure_device_ip_allowed(ip)
-    keys_list = ["DEV_ID", "DEV_VER", "SIM1_PHNUM", "SIM2_PHNUM", "SIM1_OP", "SIM2_OP", "SIM1_STA", "SIM2_STA", "SIM1_SIGNAL", "SIM2_SIGNAL", "WIFI_NAME", "WIFI_DBM"]
-    body = f"keys={json.dumps({'keys': keys_list}, ensure_ascii=False)}"
-    try:
-        resp = _get_sync_client().post(
-            f"http://{ip}/mgr",
-            params={"a": "getHtmlData_index"},
-            auth=httpx.DigestAuth(user, pw),
-            content=body.encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-            return data["data"]
-    except Exception:
-        pass
-    return None
-
-
-def get_wifi_info(ip: str, user: str, pw: str) -> Dict[str, str]:
-    _ensure_device_ip_allowed(ip)
-    keys_list = ["WIFI_NAME", "WIFI_DBM"]
-    body = f"keys={json.dumps({'keys': keys_list}, ensure_ascii=False)}"
-    try:
-        resp = _get_sync_client().post(
-            f"http://{ip}/mgr",
-            params={"a": "getHtmlData_index"},
-            auth=httpx.DigestAuth(user, pw),
-            content=body.encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-                return {
-                    "wifiName": data["data"].get("WIFI_NAME", ""),
-                    "wifiDbm": data["data"].get("WIFI_DBM", ""),
-                }
-    except Exception:
-        pass
-    return {"wifiName": "", "wifiDbm": ""}
-
-
-def read_device_config(ip: str, user: str, pw: str) -> Optional[str]:
-    _ensure_device_ip_allowed(ip)
-    body = f"keys={json.dumps({'keys': ['PROPF_1_1_1']}, ensure_ascii=False)}"
-    try:
-        resp = _get_sync_client().post(
-            f"http://{ip}/mgr",
-            params={"a": "getHtmlData_propfMgr"},
-            auth=httpx.DigestAuth(user, pw),
-            content=body.encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=TIMEOUT + 5,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
-            propf = data["data"].get("PROPF", "")
-            if isinstance(propf, str):
-                return propf
-            return json.dumps(propf, ensure_ascii=False)
-    except Exception:
-        pass
-    return None
-
-
-def write_device_config(ip: str, user: str, pw: str, content: str) -> bool:
-    _ensure_device_ip_allowed(ip)
-    try:
-        resp = _get_sync_client().post(
-            f"http://{ip}/mgr",
-            params={"a": "updateProf"},
-            data={
-                "hiddenWifi": "1",
-                "hiddenAdminPwd": "1",
-                "hiddenUserPwd": "1",
-                "propf": content,
-            },
-            auth=httpx.DigestAuth(user, pw),
-            timeout=TIMEOUT + 10,
-        )
-        return resp.status_code == 200
-    except Exception:
-        pass
-    return False
 
 
 def _device_conn_info(device: Device) -> Dict[str, Any]:
@@ -1069,45 +744,12 @@ app.include_router(devices_router)
 app.include_router(scan_router)
 app.include_router(config_router)
 
-# Keep shared helpers that are still needed by main.py
-PHONE_RE = re.compile(r"^\+?[0-9]{5,15}$")
-
-from pydantic import BaseModel, field_validator
-from typing import Any, Dict, List, Optional, Tuple
-
-class DirectDialReq(BaseModel):
-    deviceId: int
-    slot: int
-    phone: str
-    tts: str = ""
-    duration: int = 175
-    tts_times: int = 2
-    tts_pause: int = 1
-    after_action: int = 1
-
-    @field_validator("phone")
-    @classmethod
-    def _check_phone(cls, v):
-        v = (v or "").strip()
-        if not v or not PHONE_RE.match(v):
-            raise ValueError("手机号格式不正确")
-        return v
-
 # ── Device query helpers (used by routes) ────────────────────────────────────
-
-def getallnumbers(db, group: str = "") -> list:
-    from backend.db import Device
-    numbers = []
-    for device in db.query(Device).all():
-        if group and group != "all" and device.grp != group:
-            continue
-        for num, op, slot in [(device.sim1number, device.sim1operator, 1), (device.sim2number, device.sim2operator, 2)]:
-            if num and num.strip():
-                numbers.append({
-                    "deviceId": device.id, "deviceName": device.devId or device.ip,
-                    "ip": device.ip, "number": num.strip(), "operator": op or "", "slot": slot,
-                })
-    return numbers
+# NOTE: getallnumbers() is defined once, earlier in this module. It filters
+# by group in SQL and includes the ``grp`` field. A second definition used
+# to live here and shadowed it with an inferior in-Python filter that also
+# dropped the ``grp`` field -- removed. PHONE_RE is likewise defined once,
+# near the top of the module.
 
 def _apply_devices_filter(query, q: str, group: str):
     from backend.db import Device
@@ -1132,120 +774,7 @@ def _apply_devices_filter(query, q: str, group: str):
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-# ── OTA tasks (used by devices router) ───────────────────────────────────────
-
-def _ota_check(ip: str, user: str, pw: str) -> dict:
-    _ensure_device_ip_allowed(ip)
-    resp = _get_sync_client().get(
-        f"http://{ip}/ota",
-        params={"a": "chkNewVer"},
-        auth=httpx.DigestAuth(user, pw),
-        timeout=TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json() if resp.content else {}
-    return data if isinstance(data, dict) else {}
-
-def check_ota_task(device_id: int) -> dict:
-    from backend.db import Device, SessionLocal as _SL
-    db = _SL()
-    try:
-        device = db.query(Device).filter(Device.id == device_id).first()
-        if not device:
-            return {"id": device_id, "ok": False, "error": "设备不存在"}
-        ip = device.ip
-        user = (device.user or DEFAULTUSER).strip()
-        pw = (device.passwd or DEFAULTPASS).strip()
-        try:
-            data = _ota_check(ip, user, pw)
-        except HTTPException as exc:
-            return {"id": device.id, "ip": ip, "ok": False, "error": exc.detail}
-        except Exception as exc:
-            return {"id": device.id, "ip": ip, "ok": False, "error": str(exc)}
-        cur_ver = str(data.get("curVer", "") or "")
-        new_ver = str(data.get("newVer", "") or "")
-        if cur_ver:
-            device.firmware_version = cur_ver
-            try:
-                db.commit()
-            except Exception:
-                db.rollback()
-        return {
-            "id": device.id, "ip": ip, "ok": True,
-            "hasUpdate": bool(data.get("hasUpdate", False)) or (bool(new_ver) and new_ver != cur_ver),
-            "currentVer": cur_ver, "newVer": new_ver,
-        }
-    finally:
-        db.close()
-
-def upgrade_ota_task(device_id: int) -> dict:
-    from backend.db import Device, SessionLocal as _SL
-    db = _SL()
-    try:
-        device = db.query(Device).filter(Device.id == device_id).first()
-        if not device:
-            return {"id": device_id, "ok": False, "error": "设备不存在"}
-        ip = device.ip
-        user = (device.user or DEFAULTUSER).strip()
-        pw = (device.passwd or DEFAULTPASS).strip()
-        try:
-            data = _ota_check(ip, user, pw)
-            cur_ver = str(data.get("curVer", "") or "")
-            new_ver = str(data.get("newVer", "") or "")
-            if cur_ver:
-                device.firmware_version = cur_ver
-                try:
-                    db.commit()
-                except Exception:
-                    db.rollback()
-            if not new_ver or new_ver == cur_ver:
-                return {"id": device.id, "ip": ip, "ok": False, "error": "已是最新版本"}
-            upgrade_resp = _get_sync_client().get(
-                f"http://{ip}/ota",
-                params={"a": "updOtaOnline"},
-                auth=httpx.DigestAuth(user, pw),
-                timeout=TIMEOUT,
-            )
-            return {"id": device.id, "ip": ip, "ok": upgrade_resp.status_code == 200, "newVer": new_ver}
-        except HTTPException as exc:
-            return {"id": device.id, "ip": ip, "ok": False, "error": exc.detail}
-        except Exception as exc:
-            return {"id": device.id, "ip": ip, "ok": False, "error": str(exc)}
-    finally:
-        db.close()
-
-def ensure_device_token(db, device) -> str:
-    token = (getattr(device, "token", "") or "").strip()
-    if token:
-        return token
-    user = (getattr(device, "user", "") or DEFAULTUSER).strip()
-    pw = (getattr(device, "passwd", "") or DEFAULTPASS).strip()
-    _ensure_device_ip_allowed(device.ip)
-    ok, _ = istargetdevice(device.ip, user, pw)
-    if not ok:
-        raise HTTPException(status_code=400, detail="Device authentication failed")
-    token = fetch_device_token(device.ip, user, pw)
-    if not token:
-        raise HTTPException(status_code=400, detail="Failed to fetch token")
-    try:
-        device.token = token
-        db.commit()
-    except Exception:
-        pass
-    return token
-
-def fetch_device_token(ip: str, user: str, pw: str) -> str:
-    _ensure_device_ip_allowed(ip)
-    body = b"keys=%7B%22keys%22%3A%5B%22TOKEN%22%5D%7D"
-    resp = _get_sync_client().post(
-        f"http://{ip}/mgr",
-        params={"a": "getHtmlData_passwdMgr"},
-        content=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        auth=httpx.DigestAuth(user, pw),
-        timeout=TIMEOUT + 5,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    token = (payload.get("data", {}) or {}).get("TOKEN", "") or ""
-    return re.sub(r"<[^>]+>", "", str(token)).strip()
+# ── OTA tasks + device token ─────────────────────────────────────────────────
+# _ota_check / check_ota_task / upgrade_ota_task / ensure_device_token /
+# fetch_device_token now live in backend.device_client and are re-imported above
+# under their original names (the devices router imports them lazily from here).

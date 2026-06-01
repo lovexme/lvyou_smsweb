@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
-from backend.config import DEFAULTPASS, DEFAULTUSER, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
+from backend.config import BATCH_MAX, DEFAULTPASS, DEFAULTUSER, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
 from backend.db import Device, SessionLocal, get_db, nowts
 from backend.security import is_device_ip_allowed as _is_device_ip_allowed
 
@@ -367,12 +367,11 @@ def deletedevice(dev_id: int, db: Session = Depends(get_db)):
 def api_batch_delete(req: BatchDeleteReq, db: Session = Depends(get_db)):
     if not req.device_ids:
         raise HTTPException(status_code=400, detail="device_ids required")
-    deleted = 0
-    for dev_id in req.device_ids:
-        device = db.query(Device).filter(Device.id == dev_id).first()
-        if device:
-            db.delete(device)
-            deleted += 1
+    deleted = (
+        db.query(Device)
+        .filter(Device.id.in_(req.device_ids))
+        .delete(synchronize_session=False)
+    )
     db.commit()
     return {"ok": True, "deleted": deleted}
 
@@ -466,6 +465,15 @@ def tel_dial(req: DirectDialReq, db: Session = Depends(get_db)):
 
 # ── WiFi / SIM / Forward batch operations ────────────────────────────────────
 
+def _check_batch_size(device_ids: Optional[List[int]]) -> None:
+    """FIX(M2): require a non-empty device list and cap its size so a single
+    wifi/sim/forward batch can't fan out unbounded outbound device traffic."""
+    if not device_ids:
+        raise HTTPException(status_code=400, detail="device_ids required")
+    if len(device_ids) > BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"单次批量操作不得超过 {BATCH_MAX} 台")
+
+
 def _wifi_task_sync(device_info: Dict[str, Any], ssid: str, pwd: str) -> Dict[str, Any]:
     ip = device_info["ip"]
     user = device_info["user"]
@@ -491,8 +499,7 @@ def _wifi_task_sync(device_info: Dict[str, Any], ssid: str, pwd: str) -> Dict[st
 
 @router.post("/api/devices/batch/wifi/preview")
 def api_batch_wifi_preview(req: BatchWifiReq, db: Session = Depends(get_db)):
-    if not req.device_ids:
-        raise HTTPException(status_code=400, detail="device_ids required")
+    _check_batch_size(req.device_ids)
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
     infos = [_device_conn_info(d) for d in devices]
     if not infos:
@@ -518,8 +525,7 @@ def api_batch_wifi_preview(req: BatchWifiReq, db: Session = Depends(get_db)):
 
 @router.post("/api/devices/batch/wifi")
 def api_batch_wifi(req: BatchWifiReq, db: Session = Depends(get_db)):
-    if not req.device_ids:
-        raise HTTPException(status_code=400, detail="device_ids required")
+    _check_batch_size(req.device_ids)
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
     infos = [_device_conn_info(d) for d in devices]
     if not infos:
@@ -529,6 +535,51 @@ def api_batch_wifi(req: BatchWifiReq, db: Session = Depends(get_db)):
     return {"results": results}
 
 
+def _sim_task_sync(device_info: Dict[str, Any], sim1: str, sim2: str) -> Dict[str, Any]:
+    ip = device_info["ip"]
+    user = device_info["user"]
+    pw = device_info["pw"]
+    try:
+        _ensure_device_ip_allowed_raise(ip)
+        resp = _get_sync_client().post(
+            f"http://{ip}/mgr",
+            params={"a": "updatePhnum"},
+            data={"sim1Phnum": sim1, "sim2Phnum": sim2},
+            auth=httpx.DigestAuth(user, pw),
+            timeout=TIMEOUT + 5,
+        )
+        return {"id": device_info["id"], "ip": ip, "ok": resp.status_code == 200}
+    except HTTPException as exc:
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
+    except Exception as exc:
+        logger.warning("sim config %s failed: %s", ip, exc)
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "SIM配置失败"}
+
+
+@router.post("/api/devices/batch/sim")
+def api_batch_sim(req: BatchSimReq, db: Session = Depends(get_db)):
+    _check_batch_size(req.device_ids)
+    devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
+    infos = [_device_conn_info(d) for d in devices]
+    if not infos:
+        return {"results": []}
+    executor = _get_shared_executor()
+    results = list(executor.map(lambda info: _sim_task_sync(info, req.sim1, req.sim2), infos))
+    ok_ids = [r["id"] for r in results if r.get("ok")]
+    if ok_ids:
+        dev_map = {d.id: d for d in db.query(Device).filter(Device.id.in_(ok_ids)).all()}
+        for dev_id in ok_ids:
+            dev = dev_map.get(dev_id)
+            if dev:
+                dev.sim1number = req.sim1
+                dev.sim2number = req.sim2
+        db.commit()
+    return {"results": results}
+
+
+# NOTE: the single-device sim route is declared AFTER /api/devices/batch/sim so
+# the literal "batch" path is matched first; otherwise the int path param
+# {devid} would shadow it and 422 on "batch".
 @router.post("/api/devices/{devid}/sim")
 def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
     device = db.query(Device).filter(Device.id == devid).first()
@@ -557,47 +608,6 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
     except Exception as exc:
         logger.error("set sim error device=%s: %s", devid, exc, exc_info=True)
         return {"ok": False, "error": "SIM配置失败，请稍后重试"}
-
-
-def _sim_task_sync(device_info: Dict[str, Any], sim1: str, sim2: str) -> Dict[str, Any]:
-    ip = device_info["ip"]
-    user = device_info["user"]
-    pw = device_info["pw"]
-    try:
-        _ensure_device_ip_allowed_raise(ip)
-        resp = _get_sync_client().post(
-            f"http://{ip}/mgr",
-            params={"a": "updatePhnum"},
-            data={"sim1Phnum": sim1, "sim2Phnum": sim2},
-            auth=httpx.DigestAuth(user, pw),
-            timeout=TIMEOUT + 5,
-        )
-        return {"id": device_info["id"], "ip": ip, "ok": resp.status_code == 200}
-    except HTTPException as exc:
-        return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
-    except Exception as exc:
-        logger.warning("sim config %s failed: %s", ip, exc)
-        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "SIM配置失败"}
-
-
-@router.post("/api/devices/batch/sim")
-def api_batch_sim(req: BatchSimReq, db: Session = Depends(get_db)):
-    if not req.device_ids:
-        raise HTTPException(status_code=400, detail="device_ids required")
-    devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
-    infos = [_device_conn_info(d) for d in devices]
-    if not infos:
-        return {"results": []}
-    executor = _get_shared_executor()
-    results = list(executor.map(lambda info: _sim_task_sync(info, req.sim1, req.sim2), infos))
-    for r in results:
-        if r.get("ok"):
-            dev = db.query(Device).filter(Device.id == r["id"]).first()
-            if dev:
-                dev.sim1number = req.sim1
-                dev.sim2number = req.sim2
-    db.commit()
-    return {"results": results}
 
 
 def _enhanced_forward_task_sync(device_info: Dict[str, Any], req: EnhancedBatchForwardReq) -> Dict[str, Any]:
@@ -650,8 +660,7 @@ def _enhanced_forward_task_sync(device_info: Dict[str, Any], req: EnhancedBatchF
 
 @router.post("/api/devices/batch/enhanced-forward")
 def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depends(get_db)):
-    if not req.device_ids:
-        raise HTTPException(status_code=400, detail="device_ids required")
+    _check_batch_size(req.device_ids)
     devices = db.query(Device).filter(Device.id.in_(req.device_ids)).all()
     infos = [_device_conn_info(d) for d in devices]
     executor = _get_shared_executor()
@@ -662,8 +671,7 @@ def api_enhanced_batch_forward(req: EnhancedBatchForwardReq, db: Session = Depen
 @router.post("/api/devices/batch/forward")
 def api_batch_forward(req: BatchForwardReq, db: Session = Depends(get_db)):
     from backend.config import FORWARD_METHOD_BASIC
-    if not req.device_ids:
-        raise HTTPException(status_code=400, detail="device_ids required")
+    _check_batch_size(req.device_ids)
     fake = EnhancedBatchForwardReq(
         device_ids=req.device_ids, forward_method=FORWARD_METHOD_BASIC,
         forwardUrl=req.forwardUrl, notifyUrl=req.notifyUrl,
