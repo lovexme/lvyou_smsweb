@@ -114,10 +114,10 @@ pnpm install
 pnpm run build
 
 # 启动服务（同时监听 IPv4 和 IPv6）
-cd ../backend
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 &
-python -m uvicorn main:app --host :: --port 8000 &
+cd ..
+./start.sh
 # 可选：设置 BMUIPASS=your_password 自定义密码，不设置则默认 admin
+# 可选：./start.sh 9000 指定端口
 ```
 
 ## 项目结构
@@ -149,6 +149,7 @@ python -m uvicorn main:app --host :: --port 8000 &
 │   │   └── utils/           # 工具函数
 │   └── package.json
 ├── docker-entrypoint.sh # Docker 入口脚本
+├── start.sh             # 手动部署启动脚本（v4+v6 双栈）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── install.sh
