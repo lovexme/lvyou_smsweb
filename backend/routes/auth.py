@@ -82,7 +82,14 @@ class LoginReq:
 
 @router.post("/api/login")
 async def api_login(request: Request):
-    body = await request.json()
+    # FIX(L3): a malformed / non-JSON body used to bubble up as an unhandled
+    # exception (HTTP 500). Return a clean 400 instead.
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体格式错误")
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
 
@@ -110,8 +117,11 @@ async def api_login(request: Request):
     token = _issue_token(username)
     _audit("login", user=username, ip=client_ip, result="ok")
 
+    # FIX(M1): do not echo the bearer token in the JSON body. The token is set
+    # as an httpOnly cookie by _set_auth_cookies; returning it here defeated the
+    # httpOnly XSS protection and the frontend no longer reads it.
     response = JSONResponse(content={
-        "ok": True, "token": token, "username": username, "expiresIn": TOKEN_TTL_SECONDS,
+        "ok": True, "username": username, "expiresIn": TOKEN_TTL_SECONDS,
     })
     _set_auth_cookies(response, token)
     return response

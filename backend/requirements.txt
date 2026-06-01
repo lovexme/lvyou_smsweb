@@ -4,3 +4,7 @@ httpx>=0.25.0
 sqlalchemy>=2.0.0
 pydantic>=2.0.0
 regex>=2024.0.0
+# Optional metrics stack. Only imported when BMMETRICS_TOKEN is set, but
+# kept here so the documented /metrics endpoint works out of the box.
+prometheus-client>=0.19.0
+prometheus-fastapi-instrumentator>=6.1.0

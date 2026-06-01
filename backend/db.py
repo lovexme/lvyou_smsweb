@@ -25,6 +25,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    event,
     text,
 )
 from sqlalchemy.ext.declarative import declarative_base
@@ -41,6 +42,25 @@ engine = create_engine(
     pool_recycle=3600,
     connect_args={"check_same_thread": False},
 )
+
+
+# FIX(H1): SQLite ships with rollback-journal mode and busy_timeout=0, so any
+# concurrent writer (concurrent scans, batch SIM write-back, the v4/v6 process
+# pair, /metrics count queries) immediately raised "database is locked" and the
+# upsert path swallowed it -> scanned devices silently failed to save. Enable
+# WAL (readers don't block the writer) and a 5s busy_timeout (writers wait for
+# the lock instead of erroring) on every pooled connection.
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -76,6 +96,20 @@ class AuthToken(Base):
     token    = Column(String(128), primary_key=True)
     username = Column(String(64),  default="")
     exp      = Column(BigInteger,  default=0, index=True)
+
+
+# FIX(M3/H2): rate-limit events live in SQLite, mirroring the AuthToken store,
+# so the v4 + v6 uvicorn processes share a single limit budget instead of each
+# keeping its own in-memory window (which doubled every effective limit). This
+# also fixes the in-memory unbounded-key growth (H2): expired rows are pruned
+# on every touch plus a periodic sweep, so the table stays bounded by the
+# distinct keys seen inside the active window.
+class RateEvent(Base):
+    __tablename__ = "rate_events"
+    id    = Column(Integer, primary_key=True, autoincrement=True)
+    scope = Column(String(32),  index=True, nullable=False)
+    rkey  = Column(String(160), index=True, nullable=False)
+    ts    = Column(Integer,     index=True, nullable=False)
 
 
 Base.metadata.create_all(bind=engine)
@@ -163,3 +197,59 @@ def issue_token(username: str) -> str:
     token = secrets.token_urlsafe(32)
     insert_token(token, username, nowts() + TOKEN_TTL_SECONDS)
     return token
+
+
+# ── Rate-limit event store (SQLite-backed, shared across processes) ──────────
+def rate_count(scope: str, key: str, period: float) -> int:
+    """Count events for (scope, key) inside the trailing `period` seconds,
+    pruning anything older in the same statement window."""
+    cutoff = nowts() - int(period)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM rate_events WHERE scope=:s AND rkey=:k AND ts < :c"),
+                {"s": scope, "k": key, "c": cutoff},
+            )
+            row = conn.execute(
+                text("SELECT COUNT(*) FROM rate_events WHERE scope=:s AND rkey=:k"),
+                {"s": scope, "k": key},
+            ).first()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        logger.debug("rate_count failed", exc_info=True)
+        return 0
+
+
+def rate_add(scope: str, key: str) -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO rate_events(scope, rkey, ts) VALUES(:s, :k, :t)"),
+                {"s": scope, "k": key, "t": nowts()},
+            )
+    except Exception:
+        logger.debug("rate_add failed", exc_info=True)
+
+
+def rate_reset(scope: str, key: str) -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM rate_events WHERE scope=:s AND rkey=:k"),
+                {"s": scope, "k": key},
+            )
+    except Exception:
+        logger.debug("rate_reset failed", exc_info=True)
+
+
+def cleanup_rate_events(max_age: int) -> None:
+    """Periodic sweep: drop any event older than the widest configured window
+    so keys that go quiet do not leave rows behind (H2)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM rate_events WHERE ts < :c"),
+                {"c": nowts() - int(max_age)},
+            )
+    except Exception:
+        logger.debug("rate_events cleanup failed", exc_info=True)

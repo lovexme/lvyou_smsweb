@@ -61,6 +61,9 @@ LOCAL_NETS_CACHE_TTL = float(os.environ.get("BMLOCALNETSCACHETTL", "60"))
 
 # ── Limits / budgets ─────────────────────────────────────────────────────────
 OTA_BATCH_MAX    = int(os.environ.get("BMOTABATCHMAX",    "64"))
+# FIX(M2): cap the size of wifi / sim / forward batch operations the same way
+# OTA already is, so a single request can't fan out unbounded device traffic.
+BATCH_MAX        = int(os.environ.get("BMBATCHMAX",        "128"))
 CONFIG_MAX_CHARS = int(os.environ.get("BMCONFIGMAXCHARS", "524288"))
 SMS_MAX_LEN      = int(os.environ.get("BMSMSMAXLEN",      "500"))
 

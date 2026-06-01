@@ -71,6 +71,11 @@ export const useDevicesStore = defineStore('devices', () => {
   const onlineCount = computed(() => devicesOnline.value)
   const offlineCount = computed(() => devicesOffline.value)
   const selectedCount = computed(() => selectedIds.value.length)
+  // O(1) membership lookups for isSelected(), which the device table calls
+  // once per visible row on every render. Rebuilt only when the selection
+  // changes, turning the per-render cost from O(n^2) (Array.includes per
+  // row) into O(n).
+  const _selectedSet = computed(() => new Set(selectedIds.value))
 
   // FIX(P2#7): preserved as identity getters so App.vue / child components
   // keep their existing bindings. The "filtering" already happened on the
@@ -201,7 +206,7 @@ export const useDevicesStore = defineStore('devices', () => {
   }
 
   function isSelected(id) {
-    return selectedIds.value.includes(id)
+    return _selectedSet.value.has(id)
   }
 
   function clearSelection() {

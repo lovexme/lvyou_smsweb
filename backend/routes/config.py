@@ -230,7 +230,10 @@ def config_read_task_sync(device_info: Dict[str, Any]) -> Dict[str, Any]:
     except HTTPException as exc:
         return {"id": device_info["id"], "ip": ip, "ok": False, "error": exc.detail}
     except Exception as exc:
-        return {"id": device_info["id"], "ip": ip, "ok": False, "error": str(exc)}
+        # FIX(L6): log the real exception server-side but return a generic
+        # message so internal details (stack/driver strings) aren't leaked.
+        logger.warning("config read %s failed: %s", ip, exc, exc_info=True)
+        return {"id": device_info["id"], "ip": ip, "ok": False, "error": "读取配置失败"}
 
 
 def config_preview_task_sync(device_info: Dict[str, Any], pattern: str, replacement: str, flags_str: str) -> Dict[str, Any]:

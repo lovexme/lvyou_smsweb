@@ -136,6 +136,13 @@ def _cleanup_old_scans() -> None:
             _active_scans.pop(sid, None)
 
 
+# Public alias so the periodic cleanup loop in backend.main can sweep the
+# real scan registry (previously it swept a dead duplicate in main.py and
+# finished scans accumulated here until a status poll cleaned them).
+def cleanup_old_scans() -> None:
+    _cleanup_old_scans()
+
+
 def _safe_ip_in_net(ip: str, net: IPv4Network) -> bool:
     try:
         return ip_address(ip) in net

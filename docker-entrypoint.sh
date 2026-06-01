@@ -18,5 +18,11 @@ PID4=$!
 python -m uvicorn backend.main:app --host :: --port "${SERVER_PORT}" &
 PID6=$!
 
-# Wait for either to exit
-wait -n "$PID4" "$PID6" 2>/dev/null || wait
+# Wait for either listener to exit, then shut the other down.
+# FIX(L1): `wait -n` is a bashism and is NOT supported by the POSIX `sh`
+# (dash / busybox) that runs this script, so it exited immediately. Poll both
+# PIDs with `kill -0` instead, which is portable.
+while kill -0 "$PID4" 2>/dev/null && kill -0 "$PID6" 2>/dev/null; do
+    sleep 1
+done
+cleanup
