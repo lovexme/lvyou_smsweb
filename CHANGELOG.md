@@ -20,6 +20,10 @@
 - **App.vue 瘦身**：业务逻辑拆入 composables，App.vue 仅保留布局组装
 - **限流器改进**：从内存 dict 改为 SQLite 持久化，支持 v4/v6 双进程共享
 - **RateLimiter 接口变更**：构造函数新增 `scope` 参数用于事件命名空间隔离
+- **默认密码策略**：BMUIPASS 默认值从空改为 `admin`，启动时仅打警告不阻断，Docker/systemd 部署无需强制设置
+
+### Fixed
+- **systemd 双栈启动失败**：UIPASS 为空时 `Environment=BMUIPASS=` 覆盖 config.py 默认值，导致 v4/v6 服务启动失败
 
 ## [5.1.0] - 2026-05-29
 

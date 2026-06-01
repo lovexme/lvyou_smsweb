@@ -30,6 +30,12 @@
 
 新增组件：`ConfigModal.vue`、`DeviceGrid.vue`、`NumbersTable.vue`
 
+### 密码策略变更
+
+- `BMUIPASS` 默认值从空改为 `admin`，未设置时启动仅打警告不阻断
+- `install.sh` 安装时允许回车使用默认密码 `admin`
+- systemd 模板：UIPASS 为空时不写入 `Environment=BMUIPASS=` 行，避免覆盖 config.py 默认值
+
 ---
 
 ## 修复清单（基线：lvyou_smsweb_3 zip，以下为历史记录）

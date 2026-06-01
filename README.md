@@ -73,6 +73,7 @@ lvyou config
 ```bash
 # 创建环境变量文件
 echo "BMUIPASS=your_strong_password" > .env
+# 可选：不设置 BMUIPASS 则默认使用 admin
 
 # 启动
 docker compose up -d
@@ -90,7 +91,7 @@ docker compose down
 |------|--------|------|
 | `SERVER_PORT` | 8000 | 服务端口 |
 | `BMUIUSER` | admin | UI 用户名 |
-| `BMUIPASS` | （必填） | UI 登录密码 |
+| `BMUIPASS` | admin | UI 登录密码（默认 admin，建议首次登录后修改） |
 | `BMDEVUSER` | admin | 设备用户名 |
 | `BMDEVPASS` | admin | 设备密码 |
 | `BMHTTPTIMEOUT` | 5.0 | HTTP 请求超时（秒） |
@@ -114,8 +115,9 @@ pnpm run build
 
 # 启动服务（同时监听 IPv4 和 IPv6）
 cd ../backend
-BMUIPASS=your_strong_password python -m uvicorn main:app --host 0.0.0.0 --port 8000 &
-BMUIPASS=your_strong_password python -m uvicorn main:app --host :: --port 8000 &
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 &
+python -m uvicorn main:app --host :: --port 8000 &
+# 可选：设置 BMUIPASS=your_password 自定义密码，不设置则默认 admin
 ```
 
 ## 项目结构
@@ -156,7 +158,7 @@ BMUIPASS=your_strong_password python -m uvicorn main:app --host :: --port 8000 &
 
 ## 安全说明
 
-- **密码要求**：首次启动必须设置 `BMUIPASS` 环境变量（不能为 `admin` 或空）
+- **密码要求**：默认密码为 `admin`，启动时会打印安全警告，建议通过 `lvyou pass` 更换强密码
 - **本地开发**：可设置 `BMINSECURE_DEFAULT_PASSWORD=1` 跳过密码检查
 - **认证方式**：httpOnly Cookie + CSRF Token，防止 XSS 窃取
 - **SSRF 防护**：设备 IP 必须在本机子网范围内

@@ -87,9 +87,9 @@ RUN groupadd --system --gid 1000 board-manager \
 ENV BMDB=/opt/board-manager/data/data.db
 ENV BMSTATIC=/opt/board-manager/static
 ENV BMUIUSER=admin
-# FIX(P0#1): leave BMUIPASS unset on purpose so that the empty default
-# from main.py (now '') triggers _validate_startup_security() and refuses
-# to start with admin/admin. Operators must set BMUIPASS explicitly.
+# FIX(P0#1): BMUIPASS defaults to 'admin' with a startup warning.
+# Set BMUIPASS=<strong password> for production, or leave unset for quick start.
+# ENV BMUIPASS=admin
 ENV BMHTTPTIMEOUT=5.0
 ENV BMSCANCONCURRENCY=64
 ENV BMTCPCONCURRENCY=128
