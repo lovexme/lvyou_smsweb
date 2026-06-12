@@ -1,10 +1,21 @@
 import axios from 'axios'
 
+// 动态获取服务器地址
+function getBaseUrl() {
+  return localStorage.getItem('lvyou_server_url') || ''
+}
+
 // FIX(P2#1): withCredentials lets the browser attach our httpOnly auth
 // cookie on cross-origin requests when BMALLOWORIGINS is configured.
 // Same-origin (localhost-served-SPA) calls work either way, but having
 // the flag set unconditionally keeps the dev/prod CORS shape identical.
-export const api = axios.create({ baseURL: '', withCredentials: true })
+export const api = axios.create({ baseURL: getBaseUrl(), withCredentials: true })
+
+// 每次请求前刷新 baseURL（支持动态切换服务器）
+api.interceptors.request.use((config) => {
+  config.baseURL = getBaseUrl()
+  return config
+})
 
 // FIX(P2#1): kept exported for backwards-compat with any code that still
 // imports these names. The cookie migration drops sessionStorage as the

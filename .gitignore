@@ -58,3 +58,7 @@ data.db
 
 # Build leftovers
 frontend/.vite/
+*.apk
+*.zip
+data/
+node_modules/
