@@ -1,7 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<resources>
-    <string name="app_name">绿邮管理</string>
-    <string name="title_activity_main">绿邮管理</string>
-    <string name="package_name">com.lvyou.boardmanager</string>
-    <string name="custom_url_scheme">com.lvyou.boardmanager</string>
-</resources>
