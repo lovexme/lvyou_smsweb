@@ -1,0 +1,8 @@
+frontend/dist/
+frontend/node_modules/
+frontend/pnpm-lock.yaml
+frontend/package-lock.json
+*.pyc
+__pycache__/
+*.apk
+data/

@@ -1,0 +1,23 @@
+[Unit]
+Description=Board Manager (IPv4)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={{APPDIR}}
+Environment=BMDB={{APPDIR}}/data/data.db
+Environment=BMSTATIC={{APPDIR}}/static
+Environment=BMDEVUSER={{SCANUSER}}
+Environment=BMDEVPASS={{SCANPASS}}
+Environment=BMUIUSER=admin
+Environment=BMUIPASS={{UIPASS}}
+ExecStart={{APPDIR}}/venv/bin/python -m uvicorn main:app --app-dir {{APPDIR}}/app --host 0.0.0.0 --port {{APIPORT}}
+Restart=always
+RestartSec=2
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

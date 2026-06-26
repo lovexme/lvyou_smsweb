@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  lvyou-smsweb:
+    image: lovexme/lvyou-smsweb:latest
+    container_name: lvyou-smsweb
+    restart: unless-stopped
+    network_mode: host  # 必须使用 host 网络模式才能扫描局域网
+    environment:
+      # 基础配置
+      - SERVER_PORT=8000
+      - BMUIUSER=admin
+      - BMUIPASS=${BMUIPASS:-admin}  # 建议通过环境变量设置密码
+      - BMDEVUSER=admin
+      - BMDEVPASS=admin
+      
+      # 性能配置
+      - BMHTTPTIMEOUT=5.0
+      - BMSCANCONCURRENCY=64
+      - BMTCPCONCURRENCY=128
+      - BMSCANRETRIES=3
+      - BMSCANTTL=3600
+      
+      # 安全配置
+      - BMSMSRATELIMIT=10
+      - BMDIALRATELIMIT=5
+      - BMLOGINRATELIMIT=5
+      - BMSMSMAXLEN=500
+      
+      # CORS 配置
+      - BMALLOWORIGINS=${BMALLOWORIGINS:-}
+    volumes:
+      - ./data:/opt/board-manager/data
+    # FIX(P1#15): use the CMD-SHELL form so ${SERVER_PORT} is resolved inside
+    # the container at runtime (the previous list form ran curl directly with
+    # no shell, and ${SERVER_PORT} was only expanded by docker-compose at
+    # parse time against the host environment, which often left it empty).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f \"http://localhost:$$SERVER_PORT/api/health\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
