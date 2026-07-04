@@ -30,10 +30,10 @@ WORKDIR /app/frontend
 RUN npm install -g pnpm@8
 
 # 先复制依赖文件（利用 Docker 缓存）
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
+COPY frontend/package.json ./
 
 # 安装依赖
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 
 # 复制源码并构建
 COPY frontend/ ./
