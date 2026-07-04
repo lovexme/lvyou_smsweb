@@ -46,32 +46,36 @@ const emit = defineEmits(['change'])
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
-  margin-top: 16px;
-  background: var(--card);
-  border-radius: 8px;
+  padding: 14px 18px;
+  margin-top: 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 10px);
   flex-wrap: wrap;
   gap: 12px;
 }
-.pagination-info { color: var(--text-2); font-size: 13px; }
+.pagination-info { color: var(--text-muted, #64748b); font-size: 13px; }
 .pagination-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .pg-btn {
-  background: var(--bg);
+  background: var(--bg-input, #0f1629);
   border: 1px solid var(--border);
-  color: var(--text);
-  padding: 6px 12px;
-  border-radius: 6px;
+  color: var(--text-primary, #f1f5f9);
+  padding: 6px 14px;
+  border-radius: var(--radius-sm, 6px);
   cursor: pointer;
   font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.pg-btn:hover:not(:disabled) { background: var(--primary); color: white; border-color: var(--primary); }
-.pg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.pg-btn:hover:not(:disabled) { background: var(--primary); color: white; border-color: var(--primary); transform: translateY(-1px); }
+.pg-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .pg-current {
   background: var(--primary);
   color: white;
-  border-radius: 6px;
-  padding: 6px 12px;
+  border-radius: var(--radius-sm, 6px);
+  padding: 6px 14px;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.3);
 }
 </style>

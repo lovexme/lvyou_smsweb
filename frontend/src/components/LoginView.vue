@@ -20,7 +20,7 @@
           @keyup.enter="emit('login')"
         />
         <button class="login-button" :disabled="loading" @click="emit('login')">
-          <span v-if="loading">验证中...</span>
+          <span v-if="loading" class="login-loading"><span class="spinner"></span> 验证中...</span>
           <span v-else>登 录</span>
         </button>
       </div>

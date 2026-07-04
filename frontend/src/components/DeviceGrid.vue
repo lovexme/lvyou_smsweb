@@ -1,27 +1,65 @@
 <script setup>
+import { ref } from 'vue'
 import { storeToRefs } from 'pinia'
-
 import { useDevicesStore, useScanStore } from '../stores'
 import { useDeviceActions } from '../composables/useDeviceActions'
 import { useDetail } from '../composables/useDetail'
 import { displayName, prettyTime } from '../utils/format'
 
-const { filteredDevices } = storeToRefs(useDevicesStore())
+const props = defineProps({
+  devices: { type: Array, default: () => [] },
+  selectedIds: { type: Array, default: () => [] }
+})
+
+const emit = defineEmits(['toggle-select', 'show-detail', 'rename', 'set-group', 'delete'])
+
 const { scanning } = storeToRefs(useScanStore())
-const {
-  startScanAdd,
-  toggleSelect,
-  isSelected,
-  renameDevice,
-  setGroup,
-  deleteDevice
-} = useDeviceActions()
+const { startScanAdd } = useDeviceActions()
 const { showDetail } = useDetail()
+
+const dragDevice = ref(null)
+const dragOverId = ref(null)
+
+function isSelected(id) {
+  return props.selectedIds.includes(id)
+}
+
+function handleDragStart(e, device) {
+  dragDevice.value = device
+  e.dataTransfer.effectAllowed = 'move'
+  e.target.classList.add('dragging')
+}
+
+function handleDragEnd(e) {
+  e.target.classList.remove('dragging')
+  dragDevice.value = null
+  dragOverId.value = null
+}
+
+function handleDragOver(e, device) {
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+  if (dragDevice.value && dragDevice.value.id !== device.id) {
+    dragOverId.value = device.id
+  }
+}
+
+function handleDragLeave() {
+  dragOverId.value = null
+}
+
+function handleDrop(e, targetDevice) {
+  e.preventDefault()
+  if (dragDevice.value && dragDevice.value.id !== targetDevice.id) {
+    emit('set-group', dragDevice.value, targetDevice.grp || 'auto')
+  }
+  dragOverId.value = null
+}
 </script>
 
 <template>
   <div class="cards-grid">
-    <div v-if="filteredDevices.length === 0" class="empty-state">
+    <div v-if="devices.length === 0" class="empty-state">
       <div class="empty-icon" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6z"/></svg>
       </div>
@@ -32,13 +70,23 @@ const { showDetail } = useDetail()
     </div>
 
     <div
-      v-for="d in filteredDevices"
+      v-for="d in devices"
       :key="d.id"
       class="device-card"
-      :class="{ selected: isSelected(d.id), offline: d.status !== 'online' }"
+      :class="{
+        selected: isSelected(d.id),
+        offline: d.status !== 'online',
+        'drag-over': dragOverId === d.id
+      }"
+      draggable="true"
+      @dragstart="handleDragStart($event, d)"
+      @dragend="handleDragEnd"
+      @dragover="handleDragOver($event, d)"
+      @dragleave="handleDragLeave"
+      @drop="handleDrop($event, d)"
     >
       <div class="card-header">
-        <div class="card-checkbox" @click="toggleSelect(d.id)">
+        <div class="card-checkbox" @click="emit('toggle-select', d.id)">
           <span :class="['checkbox', { checked: isSelected(d.id) }]">✓</span>
         </div>
         <div class="card-status" :class="d.status">
@@ -79,16 +127,48 @@ const { showDetail } = useDetail()
         <button class="card-btn" @click="showDetail(d)" title="详情" aria-label="详情">
           <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/></svg>
         </button>
-        <button class="card-btn" @click="renameDevice(d)" title="改名" aria-label="改名">
+        <button class="card-btn" @click="emit('rename', d)" title="改名" aria-label="改名">
           <svg viewBox="0 0 20 20" fill="currentColor"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"/></svg>
         </button>
-        <button class="card-btn" @click="setGroup(d)" title="分组" aria-label="分组">
+        <button class="card-btn" @click="emit('set-group', d)" title="分组" aria-label="分组">
           <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M17.707 9.293a1 1 0 010 1.414l-7 7a1 1 0 01-1.414 0l-7-7A.997.997 0 012 10V5a3 3 0 013-3h5c.256 0 .512.098.707.293l7 7zM5 6a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/></svg>
         </button>
-        <button class="card-btn danger" @click="deleteDevice(d)" title="删除" aria-label="删除">
+        <button class="card-btn danger" @click="emit('delete', d)" title="删除" aria-label="删除">
           <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
         </button>
+      </div>
+
+      <div class="drag-hint" v-if="dragOverId === d.id">
+        拖放到此处分组
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.device-card {
+  position: relative;
+  cursor: grab;
+}
+.device-card:active { cursor: grabbing; }
+.device-card.dragging { opacity: 0.5; transform: scale(0.95); }
+.device-card.drag-over {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-glow);
+}
+.drag-hint {
+  position: absolute;
+  inset: 0;
+  background: rgba(59, 130, 246, 0.1);
+  border: 2px dashed var(--primary);
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--primary);
+  pointer-events: none;
+  z-index: 10;
+}
+</style>
