@@ -26,17 +26,16 @@ FROM node:20-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
-# 安装 pnpm
-RUN npm install -g pnpm@8
+# 安装 pnpm。锁文件已迁移到 lockfileVersion 9.0，需使用支持该格式的
+# pnpm 版本，避免 Docker 构建和本地安装解析出不同的依赖树。
+RUN npm install -g pnpm@10
 
-# 先复制依赖文件（利用 Docker 缓存）
-# 只复制 package.json：合并 UI 分支后仓库中的 pnpm-lock.yaml 已失效，
-# 在锁文件重新生成并提交前，不能使用 frozen-lockfile。
-COPY frontend/package.json ./
+# 先复制依赖清单和锁文件（利用 Docker 缓存）。
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
 
-# 依据当前 package.json 解析依赖，避免旧锁文件阻塞 Docker 构建。
-# 重新生成并提交 frontend/pnpm-lock.yaml 后，可恢复为 --frozen-lockfile。
-RUN pnpm install --no-frozen-lockfile
+# 锁文件已重新生成并提交，Docker 构建必须使用 frozen-lockfile，确保镜像
+# 依赖与仓库锁文件完全一致。
+RUN pnpm install --frozen-lockfile
 
 # 复制源码并构建
 COPY frontend/ ./
