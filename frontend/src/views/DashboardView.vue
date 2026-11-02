@@ -41,6 +41,9 @@
         </select>
       </div>
       <div class="toolbar-right">
+        <button class="toolbar-btn" :class="{ active: sortMode }" @click="sortMode = !sortMode">
+          {{ sortMode ? '完成排序' : '排序' }}
+        </button>
         <button class="toolbar-btn" @click="openWifiModal" :disabled="selectedCount === 0">WiFi</button>
         <button class="toolbar-btn" @click="openOtaModal" :disabled="selectedCount === 0">OTA</button>
         <button class="toolbar-btn" @click="openConfigModal" :disabled="selectedCount === 0">配置</button>
@@ -83,11 +86,15 @@
       v-if="activeTab === 'devices'"
       :devices="filteredDevices"
       :selected-ids="selectedIds"
+      :sort-mode="sortMode"
       @toggle-select="toggleSelect"
       @show-detail="showDetail"
       @rename="renameDevice"
       @set-group="setGroup"
       @delete="deleteDevice"
+      @reorder="reorderDevice"
+      @move-up="moveDeviceUp"
+      @move-down="moveDeviceDown"
     />
 
     <Pagination
@@ -126,7 +133,10 @@
       :loading="loading"
       @update-sim1="updateDetailSim('sim1number', $event)"
       @update-sim2="updateDetailSim('sim2number', $event)"
+      @update-note="updateDetailNote"
       @save="saveSimSingle"
+      @save-note="saveNote"
+      @detect="detectSim"
       @close="closeDetailModal"
     />
 
@@ -194,15 +204,37 @@ const loading = useLoading()
 const { clearNotice, setNotice } = useNotice()
 const { isDark, toggleTheme } = useTheme()
 
-const { refresh, startScanAdd, toggleSelectAll, batchDeleteSelected, toggleSelect, renameDevice, setGroup, deleteDevice } = useDeviceActions()
+const {
+  refresh,
+  startScanAdd,
+  toggleSelectAll,
+  batchDeleteSelected,
+  toggleSelect,
+  renameDevice,
+  setGroup,
+  deleteDevice,
+  moveDeviceUp,
+  moveDeviceDown,
+  reorderDevice
+} = useDeviceActions()
 const { commMode, fromSelected, toPhone, content, dialPhone, ttsText, send, dial } = useMessaging()
 const { showWifiModal, wifiSsid, wifiPwd, wifiPreviewResults, openWifiModal, closeWifiModal, previewWifi, applyWifi } = useWifi()
 const { showOtaModal, otaResults, otaUpgrading, openOtaModal, closeOtaModal, checkOta, upgradeOta } = useOta()
 const { showConfigModal, openConfigModal } = useConfigBatch()
-const { showDetailModal, deviceDetail, closeDetailModal, saveSimSingle, updateDetailSim } = useDetail()
+const {
+  showDetailModal,
+  deviceDetail,
+  closeDetailModal,
+  saveSimSingle,
+  updateDetailSim,
+  updateDetailNote,
+  saveNote,
+  detectSim
+} = useDetail()
 
 const activeTab = ref('devices')
 const pushing = ref(false)
+const sortMode = ref(false)
 
 async function setupPush() {
   if (!selectedCount.value || pushing.value) return

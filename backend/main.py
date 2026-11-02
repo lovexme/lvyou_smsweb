@@ -738,6 +738,8 @@ def _device_to_dict(device: Device) -> Dict[str, Any]:
         "lastSeen":device.lastSeen or 0,
         "created": device.created or "",
         "firmwareVersion": getattr(device, "firmware_version", "") or "",
+        "sortOrder": getattr(device, "sort_order", 0) or 0,
+        "note":      getattr(device, "note", "") or "",
         "sims": {
             "sim1": {"number": device.sim1number or "", "operator": device.sim1operator or "", "signal": device.sim1signal or 0, "label": device.sim1number or device.sim1operator or "SIM"},
             "sim2": {"number": device.sim2number or "", "operator": device.sim2operator or "", "signal": device.sim2signal or 0, "label": device.sim2number or device.sim2operator or "SIM"},
@@ -805,12 +807,17 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
         if fw_ver:
             device.firmware_version = fw_ver
     else:
+        # New boards go to the end of the operator's manual order instead of
+        # jumping to the top of the dashboard.
+        last = db.query(Device).order_by(Device.sort_order.desc()).first()
+        next_order = ((last.sort_order or 0) if last else 0) + 1
         device = Device(
             devId=devid, grp=(grp if grp is not None and str(grp).strip() else "auto"),
             ip=ip, mac=mac, user=user, passwd=pw, status="online", lastSeen=nowts(),
             sim1number=sim1num, sim1operator=sim1op, sim1signal=sim1sig,
             sim2number=sim2num, sim2operator=sim2op, sim2signal=sim2sig,
             firmware_version=fw_ver,
+            sort_order=next_order,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         db.add(device)
@@ -830,7 +837,11 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
 # plus an SSRF amplifier); real-time status now happens via explicit
 # /detail / /refresh endpoints or the scan flow.
 def listdevices(db: Session) -> List[Dict[str, Any]]:
-    devices = db.query(Device).order_by(Device.created.desc(), Device.id.desc()).all()
+    devices = (
+        db.query(Device)
+        .order_by(Device.sort_order.asc(), Device.created.desc(), Device.id.desc())
+        .all()
+    )
     return [_device_to_dict(d) for d in devices]
 
 

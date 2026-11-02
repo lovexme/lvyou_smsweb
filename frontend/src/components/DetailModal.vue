@@ -29,7 +29,23 @@
           <p class="sim-edit-title">编辑 SIM 卡号</p>
           <input :value="device.sim1number || ''" class="form-input" placeholder="SIM1 号码" @input="emit('update-sim1', $event.target.value)" />
           <input :value="device.sim2number || ''" class="form-input" placeholder="SIM2 号码" @input="emit('update-sim2', $event.target.value)" />
-          <button class="btn-confirm" :disabled="loading" @click="emit('save')">保存卡号</button>
+          <div class="sim-edit-actions">
+            <button class="btn-confirm" :disabled="loading" @click="emit('save')">保存卡号</button>
+            <button class="btn-secondary" :disabled="loading" @click="emit('detect')">自动识别卡号</button>
+          </div>
+          <p class="sim-edit-hint">多数运营商的卡不存本机号码，读不到时手动填写即可。</p>
+        </div>
+        <div class="sim-edit-section">
+          <p class="sim-edit-title">备注（套餐、月租、用途等）</p>
+          <textarea
+            :value="device.note || ''"
+            class="form-input note-input"
+            rows="3"
+            maxlength="300"
+            placeholder="例如：移动 19 元 100G，主收验证码"
+            @input="emit('update-note', $event.target.value)"
+          ></textarea>
+          <button class="btn-confirm" :disabled="loading" @click="emit('save-note')">保存备注</button>
         </div>
       </div>
       <div class="modal-footer">
@@ -47,7 +63,7 @@ const props = defineProps({
   loading: { type: Boolean, default: false }
 })
 
-const emit = defineEmits(['close', 'save', 'update-sim1', 'update-sim2'])
+const emit = defineEmits(['close', 'save', 'detect', 'update-sim1', 'update-sim2', 'update-note', 'save-note'])
 
 const device = computed(() => props.detail.device || {})
 

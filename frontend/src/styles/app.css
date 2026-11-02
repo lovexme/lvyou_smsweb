@@ -443,6 +443,11 @@ body {
 }
 .toolbar-btn.danger { color: var(--danger); }
 .toolbar-btn.danger:hover:not(:disabled) { background: var(--danger-glow); }
+.toolbar-btn.active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-glow);
+}
 .toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
 .batch-cancel {
@@ -814,6 +819,35 @@ body {
 
 .sim-edit-section { border-top: 1px solid var(--border); padding-top: 16px; display: flex; flex-direction: column; gap: 10px; }
 .sim-edit-title { font-size: 13px; color: var(--text-muted); margin-bottom: 2px; font-weight: 500; }
+.sim-edit-actions { display: flex; gap: 10px; }
+.sim-edit-actions .btn-confirm { flex: 1; }
+.sim-edit-hint { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.note-input { resize: vertical; font-family: inherit; line-height: 1.5; }
+.btn-secondary {
+  background: var(--bg-card-hover);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 11px 16px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: all var(--transition);
+}
+.btn-secondary:hover:not(:disabled) { border-color: var(--border-light); }
+.btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Device note line on the dashboard card */
+.device-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 /* ── Preview section ── */
 .preview-section { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 20px; }

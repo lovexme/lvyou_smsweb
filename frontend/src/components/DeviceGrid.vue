@@ -8,10 +8,11 @@ import { displayName, prettyTime } from '../utils/format'
 
 const props = defineProps({
   devices: { type: Array, default: () => [] },
-  selectedIds: { type: Array, default: () => [] }
+  selectedIds: { type: Array, default: () => [] },
+  sortMode: { type: Boolean, default: false }
 })
 
-const emit = defineEmits(['toggle-select', 'show-detail', 'rename', 'set-group', 'delete'])
+const emit = defineEmits(['toggle-select', 'show-detail', 'rename', 'set-group', 'delete', 'reorder', 'move-up', 'move-down'])
 
 const { scanning } = storeToRefs(useScanStore())
 const { startScanAdd } = useDeviceActions()
@@ -51,7 +52,11 @@ function handleDragLeave() {
 function handleDrop(e, targetDevice) {
   e.preventDefault()
   if (dragDevice.value && dragDevice.value.id !== targetDevice.id) {
-    emit('set-group', dragDevice.value, targetDevice.grp || 'auto')
+    if (props.sortMode) {
+      emit('reorder', dragDevice.value, targetDevice)
+    } else {
+      emit('set-group', dragDevice.value, targetDevice.grp || 'auto')
+    }
   }
   dragOverId.value = null
 }
@@ -121,9 +126,12 @@ function handleDrop(e, targetDevice) {
           <span class="device-group">{{ d.grp || 'auto' }}</span>
           <span class="device-time">{{ prettyTime(d.lastSeen) }}</span>
         </div>
+        <div v-if="d.note" class="device-note" :title="d.note">{{ d.note }}</div>
       </div>
 
       <div class="card-actions">
+        <button v-if="sortMode" class="card-btn" @click="emit('move-up', d)" title="上移" aria-label="上移">↑</button>
+        <button v-if="sortMode" class="card-btn" @click="emit('move-down', d)" title="下移" aria-label="下移">↓</button>
         <button class="card-btn" @click="showDetail(d)" title="详情" aria-label="详情">
           <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/></svg>
         </button>
@@ -139,7 +147,7 @@ function handleDrop(e, targetDevice) {
       </div>
 
       <div class="drag-hint" v-if="dragOverId === d.id">
-        拖放到此处分组
+        {{ sortMode ? '拖放到此位置排序' : '拖放到此处分组' }}
       </div>
     </div>
   </div>

@@ -162,6 +162,20 @@ class BatchDeleteReq(BaseModel):
     device_ids: List[int]
 
 
+class MoveReq(BaseModel):
+    # Either drop before an explicit device (drag & drop) or step one slot.
+    before: Optional[int] = None
+    direction: Optional[str] = None
+
+
+class ReorderReq(BaseModel):
+    ids: List[int]
+
+
+class NoteReq(BaseModel):
+    note: str = ""
+
+
 # Message codes a board must report for the panel to show real results.
 # 402 is the async command result (the SMS "sending..." reply alone never
 # says whether it worked), 501/502/503 are inbound SMS, outbound SMS and the
@@ -269,7 +283,9 @@ def apidevices(
     db: Session = Depends(get_db),
 ):
     from backend.main import _apply_devices_filter
-    query = db.query(Device).order_by(Device.created.desc(), Device.id.desc())
+    query = db.query(Device).order_by(
+        Device.sort_order.asc(), Device.created.desc(), Device.id.desc()
+    )
     query = _apply_devices_filter(query, q, group)
     total = query.count()
     online = query.filter(Device.status == "online").count()
@@ -282,6 +298,120 @@ def apidevices(
         "page": page,
         "page_size": page_size,
         "pages": (total + page_size - 1) // page_size if total else 0,
+    }
+
+
+def _ordered_devices(db: Session) -> List[Device]:
+    return (
+        db.query(Device)
+        .order_by(Device.sort_order.asc(), Device.created.desc(), Device.id.desc())
+        .all()
+    )
+
+
+def _renumber(db: Session, devices: List[Device]) -> None:
+    for index, item in enumerate(devices, start=1):
+        item.sort_order = index
+    db.commit()
+
+
+# NOTE: declared before the /api/devices/{devid}/... routes so a literal
+# "reorder" path can never be parsed as a numeric device id.
+@router.post("/api/devices/reorder")
+def api_reorder_devices(req: ReorderReq, db: Session = Depends(get_db)):
+    devices = _ordered_devices(db)
+    known = {d.id for d in devices}
+    ids = [int(i) for i in req.ids]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=400, detail="排序列表包含重复设备")
+    if set(ids) != known:
+        raise HTTPException(status_code=400, detail="排序列表必须包含全部设备")
+    by_id = {d.id: d for d in devices}
+    _renumber(db, [by_id[i] for i in ids])
+    _audit("devices_reorder", detail=",".join(str(i) for i in ids))
+    return {"ok": True, "ids": ids}
+
+
+@router.post("/api/devices/{devid}/move")
+def api_move_device(devid: int, req: MoveReq, db: Session = Depends(get_db)):
+    devices = _ordered_devices(db)
+    index = next((i for i, d in enumerate(devices) if d.id == devid), None)
+    if index is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    device = devices.pop(index)
+    if req.before is not None:
+        target = next((i for i, d in enumerate(devices) if d.id == req.before), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="目标设备不存在")
+        devices.insert(target, device)
+    elif req.direction in ("up", "down"):
+        step = -1 if req.direction == "up" else 1
+        devices.insert(max(0, min(len(devices), index + step)), device)
+    else:
+        raise HTTPException(status_code=400, detail="需要 before 或 direction")
+    _renumber(db, devices)
+    _audit("device_move", detail=f"device={devid} before={req.before} dir={req.direction}")
+    return {"ok": True, "order": [d.id for d in devices]}
+
+
+@router.post("/api/devices/{devid}/note")
+def api_set_note(devid: int, req: NoteReq, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == devid).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    note = (req.note or "").strip()
+    if len(note) > 300:
+        raise HTTPException(status_code=400, detail="备注最多 300 字")
+    device.note = note
+    db.commit()
+    _audit("device_note", detail=f"device={devid}")
+    return {"ok": True, "note": note}
+
+
+@router.post("/api/devices/{devid}/sim/auto")
+def api_sim_auto(devid: int, db: Session = Depends(get_db)):
+    """Try to read the SIM phone number from the board.
+
+    Carrier SIMs usually do not store MSISDN, so ``readcard`` commonly returns
+    an empty ``msIsdn``. When it does return a value we fill the panel copy;
+    otherwise the manual number stays untouched.
+    """
+    from backend.device_client import ensure_device_token
+
+    device = db.query(Device).filter(Device.id == devid).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _ensure_device_ip_allowed_raise(device.ip)
+    token = ensure_device_token(db, device)
+    client = _get_sync_client()
+    found: Dict[int, str] = {}
+    errors: List[str] = []
+    for slot in (1, 2):
+        try:
+            resp = client.get(
+                f"http://{device.ip}/ctrl",
+                params={"token": token, "cmd": "readcard", "p1": slot},
+                timeout=TIMEOUT + 15,
+            )
+            body = resp.json() if resp.content else {}
+        except Exception as exc:
+            errors.append(f"SIM{slot}: {type(exc).__name__}")
+            continue
+        number = str(body.get("msIsdn") or "").strip()
+        if int(body.get("code") or 0) == 0 and number:
+            found[slot] = number
+    if 1 in found:
+        device.sim1number = found[1]
+    if 2 in found:
+        device.sim2number = found[2]
+    if found:
+        db.commit()
+    return {
+        "ok": True,
+        "found": bool(found),
+        "sim1": device.sim1number or "",
+        "sim2": device.sim2number or "",
+        "errors": errors,
     }
 
 

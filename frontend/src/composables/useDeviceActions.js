@@ -63,6 +63,19 @@ export function useDeviceActions() {
     await devicesStore.regroup(device, group)
   }
 
+  async function moveDeviceUp(device) {
+    await devicesStore.moveBy(device, 'up')
+  }
+
+  async function moveDeviceDown(device) {
+    await devicesStore.moveBy(device, 'down')
+  }
+
+  async function reorderDevice(fromDevice, toDevice) {
+    if (!fromDevice || !toDevice || fromDevice.id === toDevice.id) return
+    await devicesStore.moveBefore(fromDevice, toDevice.id)
+  }
+
   async function deleteDevice(device) {
     const ok = await dialogStore.confirm({
       title: '删除设备',
@@ -107,6 +120,9 @@ export function useDeviceActions() {
     isSelected,
     renameDevice,
     setGroup,
+    moveDeviceUp,
+    moveDeviceDown,
+    reorderDevice,
     deleteDevice,
     batchDeleteSelected
   }

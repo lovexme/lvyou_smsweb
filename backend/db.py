@@ -87,6 +87,12 @@ class Device(Base):
     # overwrites the device's stable identifier (devId).
     firmware_version = Column(String(64), default="")
     alias        = Column(String(128), default="")
+    # Manual ordering for the dashboard list (lower first). 0 means "not
+    # ordered yet", which keeps the historical newest-first ordering until the
+    # operator drags a card.
+    sort_order   = Column(Integer,     default=0)
+    # Free-form operator note (carrier plan, monthly fee, spare SIM, ...).
+    note         = Column(Text,        default="")
     created      = Column(String(32),  default="")
 
 
@@ -212,6 +218,8 @@ def run_migrations() -> None:
         ("devices", "sim1signal",       "INTEGER DEFAULT 0"),
         ("devices", "sim2signal",       "INTEGER DEFAULT 0"),
         ("devices", "firmware_version", "VARCHAR(64) DEFAULT ''"),
+        ("devices", "sort_order",       "INTEGER DEFAULT 0"),
+        ("devices", "note",             "TEXT DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, coltype in alters:

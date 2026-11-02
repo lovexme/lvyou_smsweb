@@ -133,6 +133,22 @@ export function setDeviceGroup(deviceId, group) {
   return api.post('/api/devices/' + deviceId + '/group', { group })
 }
 
+export function moveDevice(deviceId, payload) {
+  return api.post('/api/devices/' + deviceId + '/move', payload)
+}
+
+export function reorderDevices(ids) {
+  return api.post('/api/devices/reorder', { ids })
+}
+
+export function setDeviceNote(deviceId, note) {
+  return api.post('/api/devices/' + deviceId + '/note', { note })
+}
+
+export function autoDetectSim(deviceId) {
+  return api.post('/api/devices/' + deviceId + '/sim/auto')
+}
+
 export function deleteDeviceById(deviceId) {
   return api.delete('/api/devices/' + deviceId)
 }

@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 
-import { fetchDeviceDetail, saveDeviceSim } from '../api/endpoints'
+import { autoDetectSim, fetchDeviceDetail, saveDeviceSim, setDeviceNote } from '../api/endpoints'
 import { useDevicesStore } from '../stores'
 import { useLoading } from './useLoading'
 import { useNotice } from './useNotice'
@@ -58,12 +58,57 @@ export function useDetail() {
     }
   }
 
+  function updateDetailNote(value) {
+    if (deviceDetail.value && deviceDetail.value.device) {
+      deviceDetail.value.device.note = value
+    }
+  }
+
+  async function saveNote() {
+    const device = deviceDetail.value && deviceDetail.value.device
+    if (!device) return
+    loading.value = true
+    try {
+      await setDeviceNote(device.id, device.note || '')
+      setNotice('已保存备注', 'ok')
+      await devicesStore.refresh()
+    } catch (e) {
+      setNotice(errText(e, '保存备注失败'), 'err')
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function detectSim() {
+    const device = deviceDetail.value && deviceDetail.value.device
+    if (!device) return
+    loading.value = true
+    try {
+      const res = await autoDetectSim(device.id)
+      const data = (res && res.data) || {}
+      if (data.found) {
+        device.sim1number = data.sim1 || device.sim1number || ''
+        device.sim2number = data.sim2 || device.sim2number || ''
+        setNotice('已从板子读取到卡号', 'ok')
+      } else {
+        setNotice('板子读不到卡号（运营商未在卡里预存号码），请手动填写', 'warn')
+      }
+    } catch (e) {
+      setNotice(errText(e, '自动识别失败'), 'err')
+    } finally {
+      loading.value = false
+    }
+  }
+
   return {
     showDetailModal,
     deviceDetail,
     showDetail,
     closeDetailModal,
     saveSimSingle,
-    updateDetailSim
+    updateDetailSim,
+    updateDetailNote,
+    saveNote,
+    detectSim
   }
 }
