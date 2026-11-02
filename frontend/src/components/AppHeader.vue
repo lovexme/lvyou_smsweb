@@ -12,6 +12,12 @@
         <p>管理中心</p>
       </div>
     </div>
+    <nav class="header-nav">
+      <button :class="['nav-link', { active: route.path === '/dashboard' }]" @click="router.push('/dashboard')">设备</button>
+      <button :class="['nav-link', { active: route.path === '/numbers' }]" @click="router.push('/numbers')">号码</button>
+      <button :class="['nav-link', { active: route.path === '/messages' }]" @click="router.push('/messages')">短信</button>
+      <button :class="['nav-link', { active: route.path === '/calls' }]" @click="router.push('/calls')">通话</button>
+    </nav>
     <div class="header-right">
       <button class="header-btn icon-btn" @click="emit('toggle-theme')" :title="isDark ? '切换到浅色模式' : '切换到深色模式'">
         <svg v-if="isDark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
@@ -37,6 +43,8 @@
 </template>
 
 <script setup>
+import { useRoute, useRouter } from 'vue-router'
+
 defineProps({
   loading: { type: Boolean, default: false },
   scanning: { type: Boolean, default: false },
@@ -44,4 +52,26 @@ defineProps({
 })
 
 const emit = defineEmits(['scan', 'refresh', 'logout', 'toggle-theme', 'open-settings'])
+const route = useRoute()
+const router = useRouter()
 </script>
+
+<style scoped>
+.header-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 12px;
+}
+.nav-link {
+  background: transparent;
+  color: var(--text-muted, #94a3b8);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.nav-link:hover { color: var(--text, #e2e8f0); background: var(--bg-hover, rgba(148, 163, 184, 0.12)); }
+.nav-link.active { color: #fff; background: #10b981; }
+</style>

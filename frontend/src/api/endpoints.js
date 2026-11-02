@@ -89,6 +89,36 @@ export function dialDevice(payload) {
   return api.post('/api/tel/dial', payload)
 }
 
+export async function fetchSmsHistory({ page = 1, pageSize = 30, q = '', direction = '', deviceId = 0 } = {}) {
+  const params = { page, page_size: pageSize }
+  if (q) params.q = q
+  if (direction) params.direction = direction
+  if (deviceId) params.device_id = deviceId
+  const resp = await api.get('/api/messages/sms', { params })
+  return resp.data || {}
+}
+
+export async function fetchCallHistory({ page = 1, pageSize = 30, q = '', direction = '', deviceId = 0 } = {}) {
+  const params = { page, page_size: pageSize }
+  if (q) params.q = q
+  if (direction) params.direction = direction
+  if (deviceId) params.device_id = deviceId
+  const resp = await api.get('/api/messages/calls', { params })
+  return resp.data || {}
+}
+
+export function refreshMessages(deviceId) {
+  return api.post('/api/messages/refresh/' + deviceId)
+}
+
+export function fetchNotifySettings() {
+  return api.get('/api/messages/notify')
+}
+
+export function saveNotifySettings(payload) {
+  return api.post('/api/messages/notify', payload)
+}
+
 export function setDeviceAlias(deviceId, alias) {
   return api.post('/api/devices/' + deviceId + '/alias', { alias })
 }
@@ -147,4 +177,17 @@ export function fetchDeviceDetail(deviceId) {
 
 export function saveDeviceSim(deviceId, payload) {
   return api.post('/api/devices/' + deviceId + '/sim', payload)
+}
+
+// ── panel-wide settings ──────────────────────────────────────────────────────
+export function getDeviceCredentialSetting() {
+  return api.get('/api/settings/device')
+}
+
+export function saveDeviceCredentialSetting(payload) {
+  return api.post('/api/settings/device', payload)
+}
+
+export function probeDeviceCredential(payload) {
+  return api.post('/api/settings/device/probe', payload)
 }

@@ -32,6 +32,39 @@
       </div>
 
       <div class="settings-card">
+        <h3>设备接入</h3>
+        <div class="cred-form">
+          <label class="cred-row">
+            <span class="setting-label">管理员账号</span>
+            <input v-model="credUser" class="cred-input" placeholder="admin" autocomplete="off" />
+          </label>
+          <label class="cred-row">
+            <span class="setting-label">管理员密码</span>
+            <input
+              v-model="credPass"
+              class="cred-input"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="passwordConfigured ? '已设置，留空表示不修改' : '板子后台的管理员密码'"
+            />
+          </label>
+          <label class="cred-check">
+            <input v-model="applyToAll" type="checkbox" />
+            <span>同时应用到所有已添加设备</span>
+          </label>
+          <div class="cred-actions">
+            <button class="theme-toggle" :disabled="savingCred" @click="saveCred">
+              <span>{{ savingCred ? '保存中…' : '保存' }}</span>
+            </button>
+            <span class="cred-state" :class="{ err: credError }">{{ credStatus }}</span>
+          </div>
+          <p class="cred-hint">
+            扫描新设备、读取状态、批量配置和 OTA 都用这一组凭据；板子改了密码后在这里更新一次即可。
+          </p>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>快捷键</h3>
         <div class="shortcuts-list">
           <div class="shortcut-item">
@@ -71,11 +104,12 @@
 </template>
 
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore, useDevicesStore } from '../stores'
 import { useTheme } from '../composables/useTheme'
 import { useDeviceActions } from '../composables/useDeviceActions'
+import { getDeviceCredentialSetting, saveDeviceCredentialSetting } from '../api/endpoints'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -83,6 +117,62 @@ const devicesStore = useDevicesStore()
 
 const { isDark, toggleTheme } = useTheme()
 const { refresh } = useDeviceActions()
+
+const credUser = ref('admin')
+const credPass = ref('')
+const applyToAll = ref(true)
+const passwordConfigured = ref(false)
+const savingCred = ref(false)
+const credStatus = ref('')
+const credError = ref(false)
+
+async function loadCredential() {
+  try {
+    const resp = await getDeviceCredentialSetting()
+    const data = resp.data || {}
+    credUser.value = data.user || 'admin'
+    passwordConfigured.value = !!data.passwordConfigured
+    credStatus.value = passwordConfigured.value ? '已设置' : '未设置，设备操作会失败'
+    credError.value = !passwordConfigured.value
+  } catch (e) {
+    credStatus.value = '读取失败'
+    credError.value = true
+  }
+}
+
+async function saveCred() {
+  if (savingCred.value) return
+  if (!credPass.value && passwordConfigured.value) {
+    credStatus.value = '未修改密码'
+    credError.value = false
+    return
+  }
+  if (!credPass.value) {
+    credStatus.value = '请输入密码'
+    credError.value = true
+    return
+  }
+  savingCred.value = true
+  credStatus.value = ''
+  try {
+    const resp = await saveDeviceCredentialSetting({
+      user: credUser.value || 'admin',
+      password: credPass.value,
+      applyToAll: applyToAll.value,
+    })
+    const data = resp.data || {}
+    passwordConfigured.value = true
+    credPass.value = ''
+    credError.value = false
+    credStatus.value = data.devicesReset ? `已保存，${data.devicesReset} 台设备改用新凭据` : '已保存'
+    await refresh()
+  } catch (e) {
+    credError.value = true
+    credStatus.value = (e.response && e.response.data && e.response.data.detail) || '保存失败'
+  } finally {
+    savingCred.value = false
+  }
+}
 
 async function handleLogout() {
   await authStore.logout(true)
@@ -92,7 +182,9 @@ async function handleLogout() {
 onMounted(async () => {
   if (!(await authStore.restore())) {
     router.push('/login')
+    return
   }
+  await loadCredential()
 })
 </script>
 
@@ -179,4 +271,20 @@ onMounted(async () => {
 .shortcut-desc { font-size: 13px; color: var(--text-secondary); }
 .about-info { display: flex; flex-direction: column; gap: 8px; font-size: 14px; color: var(--text-secondary); }
 .about-info strong { color: var(--text-primary); font-size: 16px; }
+.cred-form { display: flex; flex-direction: column; gap: 14px; }
+.cred-row { display: flex; flex-direction: column; gap: 6px; }
+.cred-input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+.cred-input:focus { outline: none; border-color: var(--primary); }
+.cred-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+.cred-actions { display: flex; align-items: center; gap: 12px; }
+.cred-state { font-size: 13px; color: var(--text-muted); }
+.cred-state.err { color: var(--danger, #e5484d); }
+.cred-hint { font-size: 12px; color: var(--text-muted); line-height: 1.6; }
 </style>

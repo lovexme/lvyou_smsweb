@@ -14,8 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
-from backend.config import BATCH_MAX, DEFAULTPASS, DEFAULTUSER, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
+from backend.config import BATCH_MAX, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
 from backend.db import Device, SessionLocal, get_db, nowts
+from backend.settings_store import device_credential
 from backend.security import is_device_ip_allowed as _is_device_ip_allowed
 
 logger = logging.getLogger("board-manager")
@@ -323,7 +324,8 @@ def api_device_detail(devid: int, db: Session = Depends(get_db)):
     payload["sim2number"] = device.sim2number or ""
     payload["sim2operator"] = device.sim2operator or ""
     payload["sim2signal"] = device.sim2signal or 0
-    sig_data = getdevicedata(device.ip, device.user or DEFAULTUSER, device.passwd or DEFAULTPASS) or {}
+    user, pw = device_credential(device)
+    sig_data = getdevicedata(device.ip, user, pw) or {}
     payload["wifiName"] = sig_data.get("WIFI_NAME", "")
     payload["wifiDbm"] = sig_data.get("WIFI_DBM", "")
     return {"device": payload, "forwardconfig": {}, "wifilist": []}
@@ -393,8 +395,7 @@ def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="设备不存在")
     ip = device.ip
     _ensure_device_ip_allowed_raise(ip)
-    user = (device.user or DEFAULTUSER).strip()
-    pw = (device.passwd or DEFAULTPASS).strip()
+    user, pw = device_credential(device)
     try:
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
@@ -587,8 +588,7 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Device not found")
     ip = device.ip
     _ensure_device_ip_allowed_raise(ip)
-    user = (device.user or DEFAULTUSER).strip()
-    pw = (device.passwd or DEFAULTPASS).strip()
+    user, pw = device_credential(device)
     try:
         resp = _get_sync_client().post(
             f"http://{ip}/mgr",

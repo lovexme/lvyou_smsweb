@@ -21,13 +21,12 @@ import httpx
 from fastapi import HTTPException
 
 from backend.config import (
-    DEFAULTPASS,
-    DEFAULTUSER,
     SCAN_RETRIES,
     SCAN_RETRY_SLEEP_MS,
     TIMEOUT,
 )
 from backend.db import Device, SessionLocal
+from backend.settings_store import device_credential
 from backend.http_client import get_sync_client
 from backend.security import is_device_ip_allowed
 
@@ -185,8 +184,7 @@ def check_ota_task(device_id: int) -> dict:
         if not device:
             return {"id": device_id, "ok": False, "error": "设备不存在"}
         ip = device.ip
-        user = (device.user or DEFAULTUSER).strip()
-        pw = (device.passwd or DEFAULTPASS).strip()
+        user, pw = device_credential(device)
         try:
             data = ota_check(ip, user, pw)
         except HTTPException as exc:
@@ -217,8 +215,7 @@ def upgrade_ota_task(device_id: int) -> dict:
         if not device:
             return {"id": device_id, "ok": False, "error": "设备不存在"}
         ip = device.ip
-        user = (device.user or DEFAULTUSER).strip()
-        pw = (device.passwd or DEFAULTPASS).strip()
+        user, pw = device_credential(device)
         try:
             data = ota_check(ip, user, pw)
             cur_ver = str(data.get("curVer", "") or "")
@@ -251,8 +248,7 @@ def ensure_device_token(db, device) -> str:
     token = (getattr(device, "token", "") or "").strip()
     if token:
         return token
-    user = (getattr(device, "user", "") or DEFAULTUSER).strip()
-    pw = (getattr(device, "passwd", "") or DEFAULTPASS).strip()
+    user, pw = device_credential(device)
     ensure_device_ip_allowed(device.ip)
     ok, _ = istargetdevice(device.ip, user, pw)
     if not ok:

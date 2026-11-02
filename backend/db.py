@@ -28,6 +28,7 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -112,7 +113,73 @@ class RateEvent(Base):
     ts    = Column(Integer,     index=True, nullable=False)
 
 
-Base.metadata.create_all(bind=engine)
+# Runtime settings (currently the board admin credential). Kept in SQLite so
+# the v4 and v6 uvicorn processes agree and a restart keeps the value, and so
+# the UI can set it once instead of every code path hard-coding DEFAULTPASS.
+class Setting(Base):
+    __tablename__ = "settings"
+    key   = Column(String(64), primary_key=True)
+    value = Column(Text, default="")
+
+
+# SMS/call history pulled from the boards or pushed to /webhook. The old
+# lvyou-panel kept these in its own SQLite file; they live here so the whole
+# fleet is visible from one place and survives restarts.
+class SmsRecord(Base):
+    __tablename__ = "sms_records"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    device_id  = Column(Integer, index=True, nullable=True)
+    dev_id     = Column(String(128), index=True, default="")
+    sim_slot   = Column(String(16), default="")
+    phone      = Column(String(64), default="", index=True)
+    content    = Column(Text, default="")
+    direction  = Column(String(16), default="received", index=True)
+    raw_json   = Column(Text, default="")
+    sms_ts     = Column(BigInteger, default=0, index=True)
+    sms_time   = Column(String(32), default="")
+    created    = Column(String(32), default="")
+    # sha1(device|ts|slot|direction|phone|content): INSERT OR IGNORE makes
+    # polling and webhook delivery idempotent even when both arrive for the
+    # same message.
+    dedup      = Column(String(40), unique=True, index=True)
+
+
+class CallRecord(Base):
+    __tablename__ = "call_records"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    device_id  = Column(Integer, index=True, nullable=True)
+    dev_id     = Column(String(128), index=True, default="")
+    sim_slot   = Column(String(16), default="")
+    phone      = Column(String(64), default="", index=True)
+    direction  = Column(String(16), default="incoming", index=True)
+    action     = Column(String(16), default="")
+    duration   = Column(Integer, default=0)
+    raw_json   = Column(Text, default="")
+    call_time  = Column(String(32), default="")
+    start_ts   = Column(BigInteger, default=0, index=True)
+    created    = Column(String(32), default="")
+    dedup      = Column(String(40), unique=True, index=True)
+
+
+def _create_all_with_retry(attempts: int = 6) -> None:
+    """Create tables, tolerating the v4/v6 startup race.
+
+    The entrypoint starts two uvicorn processes that both import this module.
+    When a new table is introduced they can run CREATE TABLE at the same
+    instant and the loser dies with "table ... already exists" -- which is
+    exactly what happened when the settings table was added.
+    """
+    for attempt in range(attempts):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError as exc:
+            if "already exists" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
+
+_create_all_with_retry()
 
 
 def run_migrations() -> None:

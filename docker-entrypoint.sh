@@ -10,12 +10,14 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# Start IPv4 listener
-python -m uvicorn backend.main:app --host 0.0.0.0 --port "${SERVER_PORT}" &
+# Start IPv4 listener. Only this one runs the background tasks (auto-scan,
+# message polling, cleanup); both listeners share one SQLite file, so letting
+# the IPv6 one run them too doubles every scan and poll.
+BMWORKER=1 python -m uvicorn backend.main:app --host 0.0.0.0 --port "${SERVER_PORT}" &
 PID4=$!
 
-# Start IPv6 listener
-python -m uvicorn backend.main:app --host :: --port "${SERVER_PORT}" &
+# Start IPv6 listener: front end only.
+BMWORKER=0 python -m uvicorn backend.main:app --host :: --port "${SERVER_PORT}" &
 PID6=$!
 
 # Wait for either listener to exit, then shut the other down.

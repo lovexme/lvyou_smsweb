@@ -30,8 +30,6 @@ from backend.config import (
     COOKIE_SECURE,
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
-    DEFAULTPASS,
-    DEFAULTUSER,
     FORWARD_METHOD_BASIC,
     OTA_BATCH_MAX,
     SCAN_RETRIES,
@@ -76,6 +74,12 @@ from backend.http_client import (
 )
 from backend.audit import audit as _audit
 from backend.ratelimit import RateLimiter, max_period_seen as _rate_max_period
+from backend.settings_store import (
+    device_credential,
+    device_credentials_configured,
+    get_device_credentials,
+    set_device_credentials,
+)
 from backend.device_client import (
     ensure_device_ip_allowed as _ensure_device_ip_allowed,
     istargetdevice,
@@ -283,6 +287,18 @@ _cleanup_task: Optional["asyncio.Task"] = None
 # seen for STALE_DEVICE_TTL seconds (default 7 days) so they don't pile up.
 STALE_DEVICE_TTL = int(os.environ.get("BMSTALEDEVICETTL", str(7 * 86400)))
 
+# The entrypoint runs two uvicorn listeners (IPv4 + IPv6) over the same app and
+# the same SQLite database. Background tasks (LAN auto-scan, message polling,
+# cleanup) must run in exactly one of them, otherwise every board is scanned
+# and polled twice per interval. BMWORKER=0 turns this listener into a pure
+# front end; a single-listener deployment keeps the default (enabled).
+_BACKGROUND_WORKER = os.environ.get("BMWORKER", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
 
 def _cleanup_stale_devices() -> None:
     db = SessionLocal()
@@ -322,6 +338,41 @@ async def _scan_cleanup_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _auto_scan_loop() -> None:
+    """Periodic LAN scan so a newly plugged-in board joins without a click.
+
+    BMAUTOSCAN=0 disables it; BMAUTOSCANINTERVAL sets the period (seconds,
+    clamped to 5..120 minutes). The scan runs the same worker as the manual
+    button, so credentials, dedup and the device upsert path are shared.
+    """
+    if os.environ.get("BMAUTOSCAN", "1").strip() in ("0", "false", "False", "no"):
+        return
+    try:
+        interval = int(os.environ.get("BMAUTOSCANINTERVAL", "900") or 900)
+    except ValueError:
+        interval = 900
+    interval = max(300, min(interval, 7200))
+    await asyncio.sleep(90)
+    while True:
+        try:
+            from backend.routes import scan as scan_mod
+
+            cidr = getattr(scan_mod, "_guessipv4cidr", None)
+            cidr = cidr() if callable(cidr) else "192.168.68.0/24"
+            user, password = get_device_credentials()
+            scan_id = _uuid.uuid4().hex[:12]
+            state = scan_mod.ScanState()
+            state.set_cidr(cidr)
+            with scan_mod._active_scans_lock:
+                scan_mod._active_scans[scan_id] = state
+            logger.info("auto-scan start %s", cidr)
+            await asyncio.to_thread(scan_mod._run_scan_bg, scan_id, cidr, "auto", user, password)
+            logger.info("auto-scan done: %s", state.progress)
+        except Exception:
+            logger.debug("auto-scan failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _cleanup_task
@@ -332,12 +383,33 @@ async def lifespan(app: FastAPI):
     sync_client, executor = _init_runtime()
     app.state.sync_http_client = sync_client
     app.state.executor = executor
-    # FIX(P1#12): periodic cleanup task for finished scans, expired tokens,
-    # rate-limit events and stale device rows.
-    _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+    _auto_scan_task: Optional["asyncio.Task"] = None
+    _messages_task: Optional["asyncio.Task"] = None
+    if _BACKGROUND_WORKER:
+        # FIX(P1#12): periodic cleanup task for finished scans, expired tokens,
+        # rate-limit events and stale device rows.
+        _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+        _auto_scan_task = asyncio.create_task(_auto_scan_loop())
+        # SMS / call catch-up poller; the webhook path delivers real-time events.
+        from backend.messages import messages_poll_loop as _messages_poll_loop
+        _messages_task = asyncio.create_task(_messages_poll_loop())
+    else:
+        logger.info("background tasks disabled on this listener (BMWORKER=0)")
     try:
         yield
     finally:
+        if _messages_task:
+            _messages_task.cancel()
+            try:
+                await _messages_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if _auto_scan_task:
+            _auto_scan_task.cancel()
+            try:
+                await _auto_scan_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if _cleanup_task:
             _cleanup_task.cancel()
             try:
@@ -379,7 +451,22 @@ def _configure_cors(_app: FastAPI) -> None:
 # only when BMMETRICS_TOKEN is set. Leaving it out when metrics are
 # disabled means the main token_auth_mw still rejects requests instead
 # of letting them fall through to a confusing 404.
-_PUBLIC_PATHS = {"/", "/api/login", "/api/health"}
+# /webhook is called by the boards themselves (LAN sources, validated inside
+# the route by a shared token and/or the device IP allow-list).
+#
+# The SPA routes are public as *documents*: the browser has to load the app
+# shell before the router guard can redirect an unauthenticated visitor to
+# /login. They expose no data by themselves -- every /api call behind them
+# still requires a token.
+_SPA_PATHS = {
+    "/login",
+    "/dashboard",
+    "/numbers",
+    "/settings",
+    "/messages",
+    "/calls",
+}
+_PUBLIC_PATHS = {"/", "/api/login", "/api/health", "/webhook"} | _SPA_PATHS
 
 # FIX(P2#1): methods that mutate state and therefore must carry a valid
 # X-CSRF-Token header when the caller authenticated via a cookie. Bearer-
@@ -541,8 +628,8 @@ def _device_conn_info(device: Device) -> Dict[str, Any]:
         "ip": device.ip,
         "alias": device.alias or "",
         "grp": device.grp or "auto",
-        "user": (device.user or DEFAULTUSER).strip(),
-        "pw":   (device.passwd or DEFAULTPASS).strip(),
+        "user": device_credential(device)[0],
+        "pw":   device_credential(device)[1],
     }
 
 def _device_to_dict(device: Device) -> Dict[str, Any]:
@@ -673,6 +760,8 @@ from backend.routes.auth import router as auth_router
 from backend.routes.devices import router as devices_router
 from backend.routes.scan import router as scan_router
 from backend.routes.config import router as config_router
+from backend.routes.settings import router as settings_router
+from backend.routes.messages import router as messages_router
 from backend.routes import auth as _auth_mod
 from backend.routes import devices as _devices_mod
 from backend.routes import scan as _scan_mod
@@ -743,6 +832,8 @@ app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(scan_router)
 app.include_router(config_router)
+app.include_router(settings_router)
+app.include_router(messages_router)
 
 # ── Device query helpers (used by routes) ────────────────────────────────────
 # NOTE: getallnumbers() is defined once, earlier in this module. It filters
@@ -778,3 +869,22 @@ def _escape_like(value: str) -> str:
 # _ota_check / check_ota_task / upgrade_ota_task / ensure_device_token /
 # fetch_device_token now live in backend.device_client and are re-imported above
 # under their original names (the devices router imports them lazily from here).
+
+
+# The SPA is built with createWebHistory(), so /messages and friends are real
+# URLs. Without this fallback a browser refresh (or any deep link) hit the
+# auth middleware / 404 instead of the app shell. It MUST stay the last route
+# registered: FastAPI matches in registration order, so a catch-all declared
+# before include_router() would swallow every /api path.
+@app.get("/{full_path:path}", include_in_schema=False)
+def ui_spa_fallback(full_path: str):
+    if full_path.startswith(("api/", "static/")):
+        raise HTTPException(status_code=404, detail="Not Found")
+    # A path that looks like an asset (has an extension) is a genuine miss,
+    # not a client-side route; returning index.html there hides 404s.
+    if "." in full_path.rsplit("/", 1)[-1]:
+        raise HTTPException(status_code=404, detail="Not Found")
+    index_path = os.path.join(STATICDIR, "index.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="UI not built")
+    return FileResponse(index_path)
