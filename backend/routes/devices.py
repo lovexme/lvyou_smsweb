@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -400,19 +401,34 @@ def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
             raise HTTPException(status_code=400, detail="设备认证失败")
+        # Use the documented /ctrl command instead of the legacy /mgr page
+        # endpoint. /mgr answers {"success":true} as soon as its handler runs;
+        # the /ctrl response carries the board's actual queue result.
+        from backend.device_client import ensure_device_token
+        token = ensure_device_token(db, device)
+        tid = str(int(time.time()))
         resp = _get_sync_client().get(
-            f"http://{ip}/mgr",
-            params={"a": "sendsms", "sid": str(req.slot), "phone": phone, "content": content},
-            auth=httpx.DigestAuth(user, pw),
+            f"http://{ip}/ctrl",
+            params={"token": token, "cmd": "sendsms", "p1": str(req.slot),
+                    "p2": phone, "p3": content, "tid": tid},
             timeout=TIMEOUT + 3,
         )
         if resp.status_code == 200:
             try:
                 body = resp.json()
-                if isinstance(body, dict) and body.get("success") is True:
+                if isinstance(body, dict) and body.get("code") == 0:
                     _audit("sms_send", detail=f"device={req.deviceId} slot={req.slot} phone={phone[:4]}***")
-                    return {"ok": True}
-                return {"ok": False, "error": "设备返回发送失败"}
+                    note = str(body.get("note") or "")
+                    logger.info("sms queued device=%s slot=%s type=%s code=%s note=%s",
+                                req.deviceId, req.slot, body.get("type"), body.get("code"), note[:80])
+                    return {"ok": True, "queued": True, "note": note[:80]}
+                detail = ""
+                if isinstance(body, dict):
+                    detail = str(body.get("note") or body.get("msg") or body.get("error") or "")
+                logger.warning("sms rejected device=%s slot=%s type=%s code=%s note=%s",
+                               req.deviceId, req.slot, body.get("type") if isinstance(body, dict) else None,
+                               body.get("code") if isinstance(body, dict) else None, detail[:80])
+                return {"ok": False, "error": "设备返回发送失败" + (f"：{detail}" if detail else "")}
             except Exception:
                 return {"ok": False, "error": "设备返回异常"}
         return {"ok": False, "error": f"设备通信失败 (HTTP {resp.status_code})"}

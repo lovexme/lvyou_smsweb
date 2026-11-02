@@ -40,13 +40,19 @@ export function useMessaging() {
     }
     loading.value = true
     try {
-      await sendSms({
+      const resp = await sendSms({
         deviceId: sender.deviceId,
         phone: toPhone.value,
         content: content.value,
         slot: sender.slot
       })
-      setNotice('已发送', 'ok')
+      // The backend answers 200 even when the board refuses the send, so the
+      // ok flag is the real result; trusting the status code alone told users
+      // "已发送" for messages the board had already dropped.
+      if (resp && resp.data && resp.data.ok === false) {
+        throw new Error(resp.data.error || '板子返回发送失败')
+      }
+      setNotice('已提交到板子，等待发送回执', 'ok')
       toPhone.value = ''
       content.value = ''
     } catch (e) {
