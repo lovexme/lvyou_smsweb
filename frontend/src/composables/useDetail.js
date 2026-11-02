@@ -13,7 +13,16 @@ const deviceDetail = ref(null)
 // The number the operator calls to identify an unknown SIM. It is typed once
 // and kept in the browser so the quick-dial buttons never ask again.
 const MYPHONE_KEY = 'lvyou.myphone'
-const myPhone = ref(localStorage.getItem(MYPHONE_KEY) || '')
+
+function readStoredPhone() {
+  try {
+    return localStorage.getItem(MYPHONE_KEY) || ''
+  } catch (e) {
+    return ''
+  }
+}
+
+const myPhone = ref(readStoredPhone())
 
 function setMyPhone(value) {
   myPhone.value = value
