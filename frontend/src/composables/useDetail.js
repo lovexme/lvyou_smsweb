@@ -38,11 +38,12 @@ export function useDetail() {
     if (!id) return
     loading.value = true
     try {
-      await saveDeviceSim(id, {
+      const res = await saveDeviceSim(id, {
         sim1: deviceDetail.value.device.sim1number || '',
         sim2: deviceDetail.value.device.sim2number || ''
       })
-      setNotice('已保存卡号', 'ok')
+      const board = res.data && res.data.board
+      setNotice(board === 'updated' ? '已保存卡号' : '已保存到面板（板子暂时没同步）', 'ok')
       await devicesStore.refresh()
     } catch (e) {
       setNotice(errText(e, '保存失败'), 'err')

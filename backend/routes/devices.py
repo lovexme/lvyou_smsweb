@@ -768,6 +768,7 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
     ip = device.ip
     _ensure_device_ip_allowed_raise(ip)
     user, pw = device_credential(device)
+    board_state = "updated"
     try:
         resp = _get_sync_client().post(
             f"http://{ip}/mgr",
@@ -776,17 +777,19 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
             auth=httpx.DigestAuth(user, pw),
             timeout=TIMEOUT + 5,
         )
-        if resp.status_code == 200:
-            device.sim1number = req.sim1
-            device.sim2number = req.sim2
-            db.commit()
-            return {"ok": True}
-        return {"ok": False, "status": resp.status_code}
+        if resp.status_code != 200:
+            board_state = f"http_{resp.status_code}"
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("set sim error device=%s: %s", devid, exc, exc_info=True)
-        return {"ok": False, "error": "SIM配置失败，请稍后重试"}
+        board_state = "unreachable"
+        logger.warning("set sim on board failed device=%s: %s", devid, exc)
+    # The panel needs the number for alerts even when the board is offline or
+    # refuses the write, so persist it locally in every case.
+    device.sim1number = req.sim1.strip()
+    device.sim2number = req.sim2.strip()
+    db.commit()
+    return {"ok": True, "board": board_state}
 
 
 def _enhanced_forward_task_sync(device_info: Dict[str, Any], req: EnhancedBatchForwardReq) -> Dict[str, Any]:
