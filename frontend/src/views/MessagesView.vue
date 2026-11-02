@@ -37,7 +37,7 @@
           <tr>
             <th style="width:150px">时间</th>
             <th style="width:150px">设备</th>
-            <th style="width:60px">卡槽</th>
+            <th style="width:140px">卡槽</th>
             <th style="width:60px">方向</th>
             <th style="width:130px">号码</th>
             <th>内容</th>
@@ -47,7 +47,7 @@
           <tr v-for="row in items" :key="row.id">
             <td class="muted">{{ row.sms_time }}</td>
             <td>{{ row.device_name }}</td>
-            <td>{{ row.sim_slot }}</td>
+            <td>{{ simLabel(row.sim_slot, row.sim_number) }}</td>
             <td>
               <span :class="['tag', row.direction === 'received' ? 'in' : 'out']">
                 {{ row.direction === 'received' ? '收到' : '发出' }}
@@ -79,6 +79,7 @@ import AppHeader from '../components/AppHeader.vue'
 import Pagination from '../components/Pagination.vue'
 import { fetchSmsHistory, refreshMessages } from '../api/endpoints'
 import { useTheme } from '../composables/useTheme'
+import { simLabel } from '../utils/format'
 
 const router = useRouter()
 const authStore = useAuthStore()

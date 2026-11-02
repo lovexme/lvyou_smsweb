@@ -122,6 +122,10 @@ class _MaskWebhookToken(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_MaskWebhookToken())
 
+# httpx logs every request URL at INFO, and the Bark URL *is* the credential
+# (device key in the path). Keep the library quiet unless something fails.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def _env_truthy(name: str) -> bool:
     """FIX(P2#12): forward-declared so the BMDEBUG check below treats

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import secrets
 import time
 from typing import Any, Dict, Optional
@@ -45,6 +47,28 @@ def _device_label(db: Session, device_id: Optional[int], dev_id: str) -> str:
     return device.alias or device.devId or device.ip
 
 
+def _sim_number_map(db: Session, rows) -> Dict[int, tuple]:
+    """Device id -> (SIM1 本机号, SIM2 本机号) for the page being returned.
+
+    The history rows only carry ``sim1`` / ``sim2``; the human-readable number
+    lives on the device, so one extra query per page is enough.
+    """
+    ids = {r.device_id for r in rows if r.device_id}
+    if not ids:
+        return {}
+    return {
+        d.id: ((d.sim1number or "").strip(), (d.sim2number or "").strip())
+        for d in db.query(Device).filter(Device.id.in_(ids)).all()
+    }
+
+
+def _row_sim_number(sim_map: Dict[int, tuple], device_id: Optional[int], slot: str) -> str:
+    pair = sim_map.get(device_id or 0)
+    if not pair:
+        return ""
+    return pair[0] if str(slot or "").endswith("1") else pair[1]
+
+
 @router.get("/api/messages/sms")
 def api_sms_history(
     device_id: int = Query(0, ge=0),
@@ -69,6 +93,7 @@ def api_sms_history(
         .limit(page_size)
         .all()
     )
+    sim_map = _sim_number_map(db, rows)
     return {
         "total": total,
         "page": page,
@@ -81,6 +106,7 @@ def api_sms_history(
                 "dev_id": r.dev_id,
                 "device_name": _device_label(db, r.device_id, r.dev_id),
                 "sim_slot": r.sim_slot,
+                "sim_number": _row_sim_number(sim_map, r.device_id, r.sim_slot),
                 "phone": r.phone,
                 "content": r.content,
                 "direction": r.direction,
@@ -115,6 +141,7 @@ def api_call_history(
         .limit(page_size)
         .all()
     )
+    sim_map = _sim_number_map(db, rows)
     return {
         "total": total,
         "page": page,
@@ -127,6 +154,7 @@ def api_call_history(
                 "dev_id": r.dev_id,
                 "device_name": _device_label(db, r.device_id, r.dev_id),
                 "sim_slot": r.sim_slot,
+                "sim_number": _row_sim_number(sim_map, r.device_id, r.sim_slot),
                 "phone": r.phone,
                 "direction": r.direction,
                 "action": r.action,
@@ -241,21 +269,43 @@ async def api_webhook(request: Request):
     """Receive pushes from the boards (SMS, call state, sent-SMS result)."""
     ct = request.headers.get("content-type", "")
     try:
-        if "application/json" in ct:
-            data = await request.json()
-        else:
-            body = (await request.body()).decode("utf-8", "replace")
+        raw = (await request.body()).decode("utf-8", "replace").strip()
+        # Some firmware builds post the 603 hangup report as JSON while
+        # labelling it text/plain. Sniff the body before falling back to form
+        # parsing, otherwise that event arrives with no `type` at all.
+        data = None
+        if raw.startswith("{") or raw.startswith("["):
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
+        if data is None:
             from urllib.parse import unquote
-            data = dict(parse_qsl(unquote(body)))
+            data = dict(parse_qsl(unquote(raw)))
     except Exception:
         return {"status": "bad_request"}
     if not isinstance(data, dict):
         return {"status": "bad_request"}
+    if not data.get("type"):
+        logger.info("webhook untyped ct=%s keys=%s body=%s",
+                    ct or "-", ",".join(sorted(data)[:12]) or "-",
+                    re.sub(r"\d{7,}", "***", raw[:200]).replace("\n", " "))
 
     db = SessionLocal()
     try:
         if not _webhook_authorized(request, db, data):
             raise HTTPException(status_code=403, detail="webhook source not allowed")
-        return await asyncio.to_thread(ingest_push, db, data, client_ip_from_request(request))
+        # One line per push: the only way to tell "board never sent 603" from
+        # "panel dropped it" when a call ends without a record update.
+        started = time.monotonic()
+        result = await asyncio.to_thread(
+            ingest_push, db, data, client_ip_from_request(request)
+        )
+        logger.info(
+            "webhook type=%s dev=%s slot=%s took=%.0fms",
+            data.get("type"), data.get("devId"), data.get("slot"),
+            (time.monotonic() - started) * 1000,
+        )
+        return result
     finally:
         db.close()

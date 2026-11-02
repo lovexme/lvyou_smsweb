@@ -18,6 +18,8 @@ import hashlib
 import hmac
 import json
 import logging
+import re
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -39,6 +41,24 @@ CST = timezone(timedelta(hours=8))
 KEY_NOTIFY_WEBHOOK = "dingtalk_webhook"
 KEY_NOTIFY_SECRET = "dingtalk_secret"
 KEY_WEBHOOK_TOKEN = "webhook_token"
+
+_bark_client: Optional[httpx.Client] = None
+
+
+def _get_bark_client() -> httpx.Client:
+    """IPv4-only client for Bark.
+
+    The N1 has no working IPv6 route, and httpx otherwise spends the whole
+    timeout on a failed IPv6 handshake before falling back. Pinning the local
+    address to 0.0.0.0 takes the IPv4 path immediately.
+    """
+    global _bark_client
+    if _bark_client is None:
+        _bark_client = httpx.Client(
+            transport=httpx.HTTPTransport(local_address="0.0.0.0"),
+            timeout=10,
+        )
+    return _bark_client
 KEY_BARK_URL = "bark_url"
 
 POLL_INTERVAL_SECONDS = 60
@@ -228,8 +248,11 @@ def poll_device(db: Session, device: Device) -> Dict[str, int]:
             )
             if inserted:
                 added_sms += 1
+                sim_number = _pick_sim_number(device, f"sim{slot}", msg.get("msIsdn"))
+                _learn_sim_number(db, device, f"sim{slot}", sim_number)
                 notify_sms(device_label(device), f"sim{slot}", str(msg.get("phNum") or ""),
-                           str(msg.get("smsBd") or ""), direction, db=db)
+                           str(msg.get("smsBd") or ""), direction, db=db,
+                           sim_number=sim_number)
 
     res = device_call(device.ip, token, "querytel", {"p1": "1", "p2": "50"}, timeout=12)
     if res.get("code") == 0 and isinstance(res.get("results"), list):
@@ -285,6 +308,10 @@ def poll_all() -> Dict[str, Any]:
 
 CALL_EVENT_TYPES = {601, 602, 603, 620, 621, 622, 623}
 
+_LOCAL_PHONE_RE = re.compile(r"号码[：:]\s*([+0-9]+)")
+_LOCAL_DEV_RE = re.compile(r"来自设备[：:]\s*([0-9A-Za-z_-]+)")
+_LOCAL_SLOT_RE = re.compile(r"卡\s*(\d)")
+
 
 def _find_device(db: Session, dev_id: str, source_ip: str = "") -> Optional[Device]:
     device = None
@@ -295,7 +322,68 @@ def _find_device(db: Session, dev_id: str, source_ip: str = "") -> Optional[Devi
     return device
 
 
+def _ingest_board_local_push(db: Session, data: Dict[str, Any], source_ip: str) -> Dict[str, Any]:
+    """Handle the board's Bark-style missed-call template.
+
+    Some firmware builds render 603 through the board's own "local push"
+    template instead of the raw event JSON. The template has no type field,
+    but it names the caller and the device, which is enough to close the
+    ringing record that the matching 601 opened.
+    """
+    body = str(data.get("body") or "")
+    if "未接来电" not in body:
+        return {"status": "ignored", "reason": "local-push"}
+    phone_match = _LOCAL_PHONE_RE.search(body)
+    if not phone_match:
+        return {"status": "ignored", "reason": "local-push-no-phone"}
+    phone = phone_match.group(1)
+    dev_match = _LOCAL_DEV_RE.search(body)
+    dev_id = dev_match.group(1) if dev_match else ""
+    slot_match = _LOCAL_SLOT_RE.search(body)
+    slot = f"sim{slot_match.group(1)}" if slot_match else "sim1"
+    device = _find_device(db, dev_id, source_ip)
+    label = device_label(device) if device else (dev_id or source_ip or "unknown")
+
+    query = db.query(CallRecord).filter(CallRecord.action == "ringing")
+    if device is not None:
+        query = query.filter(CallRecord.device_id == device.id)
+    elif dev_id:
+        query = query.filter(CallRecord.dev_id == dev_id)
+    else:
+        return {"status": "ignored", "reason": "local-push-no-device"}
+    push_digits = re.sub(r"[^0-9]", "", phone)
+    rec = None
+    for candidate in query.order_by(CallRecord.start_ts.desc()).limit(20).all():
+        rec_digits = re.sub(r"[^0-9]", "", candidate.phone or "")
+        if not rec_digits or not push_digits or rec_digits == push_digits:
+            rec = candidate
+            break
+    if rec is None:
+        return {"status": "ignored", "reason": "local-push-no-ringing"}
+
+    sim_number = ""
+    try:
+        original = json.loads(rec.raw_json or "{}")
+    except Exception:
+        original = {}
+    sim_number = _pick_sim_number(device, slot, original.get("msIsdn"))
+
+    rec.action = "missed"
+    rec.duration = 0
+    clean = {k: v for k, v in data.items() if k not in ("device_key", "device_keys")}
+    rec.raw_json = json.dumps(clean, ensure_ascii=False)
+    db.commit()
+    # The board already tried to push this itself; forward it through the
+    # panel only when the call just ended, so stale payloads do not buzz.
+    if time.time() - int(rec.start_ts or 0) < 180:
+        _notify_call(label, slot, phone, title="未接来电", detail="没有接听",
+                     db=db, sim_number=sim_number)
+    return {"status": "ok", "stored": False, "id": rec.id, "type": "local-missed"}
+
+
 def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[str, Any]:
+    if not data.get("type") and (data.get("body") or data.get("subtitle")):
+        return _ingest_board_local_push(db, data, source_ip)
     try:
         msg_type = int(data.get("type", 0))
     except (TypeError, ValueError):
@@ -319,8 +407,11 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
             content=content, direction=direction, sms_ts=sms_ts, raw=data,
         )
         if inserted:
+            sim_number = _pick_sim_number(device, slot, data.get("msIsdn"))
+            _learn_sim_number(db, device, slot, sim_number)
             notify_sms(label, slot, phone, content, direction,
-                       msg_type=msg_type, db=db)
+                       msg_type=msg_type, db=db,
+                       sim_number=sim_number)
         if msg_type == 502:
             _update_sms_job(
                 db, data,
@@ -348,15 +439,10 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
             }.get(reason, reason)
             job = _update_sms_job(db, data, status="failed", note=reason_cn)
             if job is not None:
-                send_bark(
-                    "绿邮 · 短信发送失败",
-                    f"{label} {job.slot}\n{job.phone}\n{reason_cn}",
-                    db=db,
-                )
-                send_dingtalk(
-                    f"⚠️ {label} 短信发送失败\n号码：{job.phone}\n原因：{reason_cn}",
-                    db=db,
-                )
+                _run_async(send_bark, "绿邮 · 短信发送失败",
+                           f"{label} {job.slot}\n{job.phone}\n{reason_cn}")
+                _run_async(send_dingtalk,
+                           f"⚠️ {label} 短信发送失败\n号码：{job.phone}\n原因：{reason_cn}")
         return {"status": "ok", "type": 402, "subType": 16}
 
     if msg_type == 503:
@@ -369,7 +455,7 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
         )
         if job is not None:
             text = ("运营商确认送达" if sms_st == 0 else f"送达失败（smsSt={sms_st}）")
-            send_bark(f"绿邮 · 短信{text}", f"{label} {job.slot}\n{job.phone}", db=db)
+            _run_async(send_bark, f"绿邮 · 短信{text}", f"{label} {job.slot}\n{job.phone}")
         return {"status": "ok", "type": 503, "smsSt": sms_st}
 
     if msg_type in CALL_EVENT_TYPES:
@@ -404,17 +490,21 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
             direction=direction, action=action, duration=duration,
             start_ts=start, raw=data, update_existing=msg_type not in (601, 620),
         )
+        sim_number = _pick_sim_number(device, slot, data.get("msIsdn"))
+        _learn_sim_number(db, device, slot, sim_number)
         if msg_type in (601, 620):
             _notify_call(
                 label, slot, phone,
                 title="来电" if msg_type == 601 else "拨出",
                 detail="响铃中" if msg_type == 601 else "正在呼叫",
-                db=db,
+                db=db, sim_number=sim_number,
             )
         elif msg_type == 603 and action == "missed" and prev_action != "missed":
-            _notify_call(label, slot, phone, title="未接来电", detail="没有接听", db=db)
+            _notify_call(label, slot, phone, title="未接来电", detail="没有接听",
+                         db=db, sim_number=sim_number)
         elif msg_type == 623 and action == "missed" and prev_action != "missed":
-            _notify_call(label, slot, phone, title="去电未接通", detail="对方未接或占线", db=db)
+            _notify_call(label, slot, phone, title="去电未接通", detail="对方未接或占线",
+                         db=db, sim_number=sim_number)
         return {"status": "ok", "stored": inserted, "id": rec_id, "type": msg_type}
 
     return {"status": "ignored", "type": msg_type}
@@ -496,7 +586,8 @@ def send_dingtalk(text: str, db: Optional[Session] = None) -> bool:
         return False
 
 
-def send_bark(title: str, body: str, db: Optional[Session] = None) -> bool:
+def send_bark(title: str, body: str, db: Optional[Session] = None,
+              extra: Optional[dict] = None) -> bool:
     """Post one notification to the configured Bark URL.
 
     Bark may answer HTTP 200 while still rejecting the request in its JSON
@@ -512,44 +603,121 @@ def send_bark(title: str, body: str, db: Optional[Session] = None) -> bool:
             db.close()
     if not url:
         return False
+    payload_data = {"title": title, "body": body, "group": "绿邮"}
+    if extra:
+        payload_data.update(extra)
+    last_error = None
+    for _attempt in range(2):
+        try:
+            resp = _get_bark_client().post(url, json=payload_data, timeout=10)
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            payload = resp.json()
+            ok = isinstance(payload, dict) and int(payload.get("code") or 0) == 200
+            if ok:
+                return True
+            last_error = f"code={payload.get('code') if isinstance(payload, dict) else '?'}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+    logger.warning("bark notify failed after retry: %s", last_error)
+    return False
+
+
+def _run_async(fn, *args, **kwargs) -> None:
+    """Fire a notification without holding the board's webhook request.
+
+    The boards give a push only a few seconds before they retry it. DingTalk
+    and Bark can each take several seconds, which used to make the board log
+    HTTP -11 and re-send the same 601 while the call state moved on.
+    """
+    def run():
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            logger.debug("async notify failed", exc_info=True)
+
+    threading.Thread(target=run, daemon=True, name="notify").start()
+
+
+def _slot_index(slot: str) -> str:
+    tail = str(slot or "").strip()[-1:]
+    return tail if tail in ("1", "2") else "1"
+
+
+def _display_sim(slot: str, sim_number: str = "") -> str:
+    label = f"卡{_slot_index(slot)}"
+    digits = re.sub(r"[^0-9+]", "", sim_number or "")
+    return f"{label} · 本机 {digits}" if len(digits) >= 5 else label
+
+
+def _pick_sim_number(device: Optional[Device], slot: str, value: Any = "") -> str:
+    number = str(value or "").strip()
+    if number:
+        return number
+    if device is None:
+        return ""
+    attr = "sim1number" if _slot_index(slot) == "1" else "sim2number"
+    return str(getattr(device, attr, "") or "")
+
+
+def _learn_sim_number(db: Optional[Session], device: Optional[Device], slot: str,
+                      number: str) -> None:
+    """Remember a number the board revealed once, so later alerts can show it.
+
+    The firmware never reports its own MSISDN through ``stat`` / ``readcard``;
+    the only place it shows up is inside some SMS pushes. Persist it the first
+    time we see one and keep the DB value (the user may have edited it).
+    """
+    digits = re.sub(r"[^0-9+]", "", number or "")
+    if db is None or device is None or len(digits) < 5:
+        return
+    attr = "sim1number" if _slot_index(slot) == "1" else "sim2number"
+    if str(getattr(device, attr, "") or "").strip():
+        return
     try:
-        resp = get_sync_client().post(
-            url,
-            json={"title": title, "body": body, "group": "绿邮"},
-            timeout=8,
-        )
-        if resp.status_code != 200:
-            logger.warning("bark notify HTTP %s", resp.status_code)
-            return False
-        payload = resp.json()
-        ok = isinstance(payload, dict) and int(payload.get("code") or 0) == 200
-        if not ok:
-            logger.warning("bark notify rejected: code=%s", payload.get("code") if isinstance(payload, dict) else "?")
-        return ok
+        setattr(device, attr, digits)
+        db.commit()
     except Exception:
-        logger.warning("bark notify failed", exc_info=True)
-        return False
+        db.rollback()
+        logger.debug("learn sim number failed", exc_info=True)
 
 
 def notify_sms(dev_name: str, slot: str, phone: str, content: str,
                direction: str, msg_type: int = 0,
-               db: Optional[Session] = None) -> None:
+               db: Optional[Session] = None, sim_number: str = "") -> None:
     emoji = "📩" if direction == "received" else "📤"
     label = "收到" if direction == "received" else "发出"
-    text = f"{emoji} {dev_name} {label}短信\n卡槽：{slot}\n号码：{phone}\n内容：{content}"
-    send_dingtalk(text, db=db)
+    text = f"{emoji} {dev_name} {label}短信\n卡槽：{_display_sim(slot, sim_number)}\n号码：{phone}\n内容：{content}"
+    _run_async(send_dingtalk, text)
     title = "新短信" if direction == "received" else "短信已发出"
     subtitle = "已提交运营商" if msg_type == 502 else label
-    send_bark(f"绿邮 · {title}", f"{dev_name} {slot}\n{subtitle}\n{phone}\n{content}", db=db)
+    _run_async(send_bark, f"绿邮 · {title}",
+               f"{dev_name} · {_display_sim(slot, sim_number)}\n{subtitle}\n{phone}\n{content}")
 
 
 def _notify_call(dev_name: str, slot: str, phone: str, *, title: str,
-                 detail: str, db: Optional[Session] = None) -> None:
+                 detail: str, db: Optional[Session] = None,
+                 sim_number: str = "") -> None:
     """Ring/missed/unanswered alert on both push channels."""
-    text = f"📞 {dev_name} {title}：{phone}"
-    send_dingtalk(text, db=db)
-    body = "\n".join(x for x in (f"{dev_name} {slot}", detail, phone) if x)
-    send_bark(f"绿邮 · {title}", body, db=db)
+    text = f"📞 {dev_name} {title}：{phone}（{_display_sim(slot, sim_number)}）"
+    _run_async(send_dingtalk, text)
+    # The number is the title; repeating it in the body doubles the alert on
+    # the lock screen. Body carries only the source and the call state.
+    body = "\n".join(x for x in (f"{dev_name} · {_display_sim(slot, sim_number)}", detail) if x)
+    # Put the number in the title: that is the only line iOS shows when the
+    # banner is collapsed, and it is what the user needs to decide to pick up.
+    head = f"{title} {phone}".strip() if phone else f"绿邮 · {title}"
+    extra = {"level": "timeSensitive"}
+    if title == "来电":
+        extra["call"] = "1"
+    # Bark opens `url` when the alert is tapped. A tel: link turns the
+    # notification into a one-tap callback from the user's own phone; the
+    # board has no API to bridge live call audio elsewhere.
+    dialable = re.sub(r"[^0-9+]", "", phone or "")
+    if len(dialable) >= 5:
+        extra["url"] = f"tel:{dialable}"
+    _run_async(send_bark, head, body, None, extra)
 
 
 # ── Background loop ──────────────────────────────────────────────────────────
