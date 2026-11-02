@@ -137,6 +137,12 @@ export function deleteDeviceById(deviceId) {
   return api.delete('/api/devices/' + deviceId)
 }
 
+// Point the boards at this panel's /webhook and turn on the 402/5xx/6xx
+// report codes, so SMS results and call events actually reach the dashboard.
+export function setupDevicePush(deviceIds) {
+  return api.post('/api/devices/push/setup', { device_ids: deviceIds })
+}
+
 export function checkOtaBatch(deviceIds) {
   return api.post('/api/devices/batch/ota/check', { device_ids: deviceIds })
 }

@@ -391,14 +391,30 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
                 "missed" if direction == "incoming" else "no_answer"
             )
         duration = max(0, end - connected) if answered and end else 0
+        # A missed-call / unanswered-outgoing push repeats until the call
+        # record reaches its final state; only announce the transition.
+        prev_action = ""
+        if msg_type in (603, 623):
+            ident = dev_id or (device.devId if device else "") or "-"
+            row = db.query(CallRecord).filter(CallRecord.dedup == _dedup(ident, "call", start)).first()
+            prev_action = row.action if row else ""
+
         inserted, rec_id = store_call(
             db, device=device, dev_id=dev_id, sim_slot=slot, phone=phone,
             direction=direction, action=action, duration=duration,
             start_ts=start, raw=data, update_existing=msg_type not in (601, 620),
         )
         if msg_type in (601, 620):
-            label_cn = "来电" if msg_type == 601 else "去电"
-            send_dingtalk(f"📞 {label} {label_cn}：{phone}", db=db)
+            _notify_call(
+                label, slot, phone,
+                title="来电" if msg_type == 601 else "拨出",
+                detail="响铃中" if msg_type == 601 else "正在呼叫",
+                db=db,
+            )
+        elif msg_type == 603 and action == "missed" and prev_action != "missed":
+            _notify_call(label, slot, phone, title="未接来电", detail="没有接听", db=db)
+        elif msg_type == 623 and action == "missed" and prev_action != "missed":
+            _notify_call(label, slot, phone, title="去电未接通", detail="对方未接或占线", db=db)
         return {"status": "ok", "stored": inserted, "id": rec_id, "type": msg_type}
 
     return {"status": "ignored", "type": msg_type}
@@ -525,6 +541,15 @@ def notify_sms(dev_name: str, slot: str, phone: str, content: str,
     title = "新短信" if direction == "received" else "短信已发出"
     subtitle = "已提交运营商" if msg_type == 502 else label
     send_bark(f"绿邮 · {title}", f"{dev_name} {slot}\n{subtitle}\n{phone}\n{content}", db=db)
+
+
+def _notify_call(dev_name: str, slot: str, phone: str, *, title: str,
+                 detail: str, db: Optional[Session] = None) -> None:
+    """Ring/missed/unanswered alert on both push channels."""
+    text = f"📞 {dev_name} {title}：{phone}"
+    send_dingtalk(text, db=db)
+    body = "\n".join(x for x in (f"{dev_name} {slot}", detail, phone) if x)
+    send_bark(f"绿邮 · {title}", body, db=db)
 
 
 # ── Background loop ──────────────────────────────────────────────────────────

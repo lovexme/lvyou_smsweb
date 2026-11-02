@@ -20,6 +20,7 @@ from backend.config import BATCH_MAX, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
 from backend.db import Device, SessionLocal, SmsJob, get_db, nowts
 from backend.settings_store import device_credential
 from backend.security import is_device_ip_allowed as _is_device_ip_allowed
+from backend.security import panel_base_url_for
 
 logger = logging.getLogger("board-manager")
 
@@ -158,6 +159,17 @@ class GroupReq(BaseModel):
 
 
 class BatchDeleteReq(BaseModel):
+    device_ids: List[int]
+
+
+# Message codes a board must report for the panel to show real results.
+# 402 is the async command result (the SMS "sending..." reply alone never
+# says whether it worked), 501/502/503 are inbound SMS, outbound SMS and the
+# carrier report, and 601-623 are the call states the dashboard lists.
+PUSH_MSG_CODES = "402,501,502,503,601,602,603,620,621,622,623"
+
+
+class PushSetupReq(BaseModel):
     device_ids: List[int]
 
 
@@ -381,6 +393,114 @@ def api_batch_delete(req: BatchDeleteReq, db: Session = Depends(get_db)):
 
 
 # ── SMS / Dial ───────────────────────────────────────────────────────────────
+
+
+@router.post("/api/devices/push/setup")
+def api_push_setup(req: PushSetupReq, db: Session = Depends(get_db)):
+    """Point the selected boards at this panel and enable the report codes.
+
+    A board that only has the panel's IP added still sends nothing back: its
+    main report interface may point anywhere, and 402 (command result) is
+    disabled by default. Both are one /ctrl call each, so the UI exposes them
+    as a single button instead of asking the operator to hand-edit boards.
+    """
+    ids = req.device_ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="device_ids required")
+    if len(ids) > BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"一次最多处理 {BATCH_MAX} 台设备")
+
+    from backend.messages import KEY_WEBHOOK_TOKEN, get_setting, set_setting
+
+    token = (get_setting(db, KEY_WEBHOOK_TOKEN, "") or "").strip()
+    token_created = False
+    if not token:
+        token = secrets.token_urlsafe(24)
+        set_setting(db, KEY_WEBHOOK_TOKEN, token)
+        token_created = True
+
+    client = _get_sync_client()
+    wanted = [int(x) for x in PUSH_MSG_CODES.split(",")]
+    items: List[Dict[str, Any]] = []
+    from backend.device_client import ensure_device_token
+
+    for device in db.query(Device).filter(Device.id.in_(ids)).all():
+        item: Dict[str, Any] = {
+            "device_id": device.id,
+            "devId": device.devId or "",
+            "ip": device.ip,
+            "ok": False,
+        }
+        try:
+            base = panel_base_url_for(device.ip)
+            webhook_url = f"{base}/webhook?k={token}"
+            item["panel"] = base
+            dtok = ensure_device_token(db, device)
+
+            def ctrl(**params: Any):
+                resp = client.get(
+                    f"http://{device.ip}/ctrl",
+                    params={"token": dtok, **params},
+                    timeout=TIMEOUT + 5,
+                )
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                return resp.status_code, body
+
+            _, setinf = ctrl(cmd="setinf", p1=webhook_url, p2="post", p3="json")
+            if int(setinf.get("code") or 0) != 0:
+                raise RuntimeError(
+                    f"设置上报接口失败：{setinf.get('note') or setinf.get('code')}"
+                )
+            _, setcode = ctrl(
+                cmd="setallmsgcode", p1=PUSH_MSG_CODES, p2="on", p3="replace"
+            )
+            if int(setcode.get("code") or 0) != 0:
+                raise RuntimeError(
+                    f"设置消息号失败：{setcode.get('note') or setcode.get('code')}"
+                )
+
+            _, inf = ctrl(cmd="askinf")
+            try:
+                inf_cfg = json.loads(inf.get("val") or "{}")
+            except Exception:
+                inf_cfg = {}
+            inf_url = str(inf_cfg.get("url") or "")
+            if "/webhook?k=" not in inf_url or base.split("//", 1)[-1] not in inf_url:
+                raise RuntimeError("复查失败：上报接口未生效")
+
+            _, codes = ctrl(cmd="askallmsgcode")
+            try:
+                enabled = set(json.loads(codes.get("val") or "{}").get("en") or [])
+            except Exception:
+                enabled = set()
+            missing = [c for c in wanted if c not in enabled]
+            if missing:
+                raise RuntimeError(
+                    "复查失败：缺少消息号 " + ",".join(str(c) for c in missing)
+                )
+
+            item.update(ok=True, method=inf_cfg.get("method"), ctype=inf_cfg.get("ctype"))
+            _audit("push_setup", detail=f"device={device.devId} ip={device.ip}")
+        except HTTPException as exc:
+            item["error"] = str(exc.detail)
+        except Exception as exc:
+            logger.warning("push setup failed for %s: %s", device.ip, exc)
+            item["error"] = str(exc)[:200]
+        items.append(item)
+
+    found = {i["device_id"] for i in items}
+    for missing_id in [i for i in ids if i not in found]:
+        items.append({"device_id": missing_id, "ok": False, "error": "设备不存在"})
+
+    return {
+        "ok": all(i.get("ok") for i in items) and bool(items),
+        "webhook_token_created": token_created,
+        "msg_codes": PUSH_MSG_CODES,
+        "items": items,
+    }
 
 @router.post("/api/sms/send-direct")
 def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):

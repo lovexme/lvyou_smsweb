@@ -138,6 +138,60 @@ def local_ipv4_networks() -> List[IPv4Network]:
         return nets
 
 
+def panel_base_url_for(device_ip: str, port: str = "") -> str:
+    """Address the board should use to reach this panel.
+
+    Boards live on the LAN, so the URL has to carry a LAN address of the
+    host, not "localhost" and not a public hostname. We pick the local
+    address that shares a subnet with the board; docker/bridge interfaces
+    are skipped because a board cannot route to them.
+    """
+    import os
+
+    override = os.environ.get("BMPANELURL", "").strip()
+    if override:
+        return override.rstrip("/")
+
+    try:
+        target = ip_address(device_ip)
+    except ValueError:
+        raise RuntimeError(f"设备 IP 非法：{device_ip}")
+
+    chosen = ""
+    fallback = ""
+    try:
+        txt = run_cmd(["ip", "-o", "-4", "addr", "show"])
+    except Exception:
+        txt = ""
+    for line in txt.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface, cidr = parts[1], parts[3]
+        if iface == "lo":
+            continue
+        try:
+            net = ip_network(cidr, strict=False)
+            if target not in net:
+                continue
+        except Exception:
+            continue
+        addr = cidr.split("/")[0]
+        if iface.startswith(("docker", "br-", "veth")):
+            fallback = fallback or addr
+            continue
+        chosen = addr
+        break
+    chosen = chosen or fallback
+    if not chosen:
+        raise RuntimeError(
+            "无法确定面板的内网地址；请用环境变量 BMPANELURL 指定，例如 "
+            "http://192.168.1.10:8000"
+        )
+    port = port or os.environ.get("SERVER_PORT", "8000")
+    return f"http://{chosen}:{port}"
+
+
 def is_device_ip_allowed(ip: str) -> bool:
     """FIX(P0#4): SSRF allow-list. Two layers:
       1. Must be RFC1918 private / IPv6 ULA, never loopback/link-local/etc.

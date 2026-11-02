@@ -44,6 +44,9 @@
         <button class="toolbar-btn" @click="openWifiModal" :disabled="selectedCount === 0">WiFi</button>
         <button class="toolbar-btn" @click="openOtaModal" :disabled="selectedCount === 0">OTA</button>
         <button class="toolbar-btn" @click="openConfigModal" :disabled="selectedCount === 0">配置</button>
+        <button class="toolbar-btn" @click="setupPush" :disabled="selectedCount === 0 || pushing">
+          {{ pushing ? '接入中…' : '接入推送' }}
+        </button>
         <button class="toolbar-btn danger" @click="batchDeleteSelected" :disabled="selectedCount === 0">删除</button>
       </div>
     </div>
@@ -164,6 +167,7 @@ import { useConfigBatch } from '../composables/useConfigBatch'
 import { useDetail } from '../composables/useDetail'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { useTheme } from '../composables/useTheme'
+import { setupDevicePush } from '../api/endpoints'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -187,7 +191,7 @@ const {
 const { scanning } = storeToRefs(scanStore)
 
 const loading = useLoading()
-const { clearNotice } = useNotice()
+const { clearNotice, setNotice } = useNotice()
 const { isDark, toggleTheme } = useTheme()
 
 const { refresh, startScanAdd, toggleSelectAll, batchDeleteSelected, toggleSelect, renameDevice, setGroup, deleteDevice } = useDeviceActions()
@@ -198,6 +202,33 @@ const { showConfigModal, openConfigModal } = useConfigBatch()
 const { showDetailModal, deviceDetail, closeDetailModal, saveSimSingle, updateDetailSim } = useDetail()
 
 const activeTab = ref('devices')
+const pushing = ref(false)
+
+async function setupPush() {
+  if (!selectedCount.value || pushing.value) return
+  pushing.value = true
+  setNotice('正在为选中的设备开启推送…', 'info')
+  try {
+    const resp = await setupDevicePush(selectedIds.value.slice())
+    const data = (resp && resp.data) || {}
+    const items = data.items || []
+    const failed = items.filter(i => !i.ok)
+    if (items.length && !failed.length) {
+      setNotice(`已为 ${items.length} 台设备开启短信/通话回传`, 'ok')
+    } else {
+      setNotice(
+        '部分设备失败：' + failed.map(i => `${i.ip || i.devId} ${i.error || ''}`).join('；'),
+        'err'
+      )
+    }
+  } catch (e) {
+    const detail = (e && e.response && e.response.data && e.response.data.detail) || (e && e.message)
+    setNotice('开启推送失败：' + (detail || '请稍后重试'), 'err')
+  } finally {
+    pushing.value = false
+  }
+}
+
 const trendData = ref({
   online: [65, 72, 68, 75, 80, 78, 82],
   offline: [15, 12, 14, 10, 8, 10, 6],
