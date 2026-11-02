@@ -99,6 +99,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("board-manager")
 
 
+class _MaskWebhookToken(logging.Filter):
+    """Strip the board webhook token from uvicorn's access log.
+
+    The token has to travel in the query string (``/webhook?k=...``) because
+    the board's setinf command can only configure a URL, method and
+    Content-Type -- it cannot send a custom header. Uvicorn logs the full
+    request line, so the secret would otherwise end up in plain text in
+    ``docker logs``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = args[2]
+            if isinstance(path, str) and path.startswith("/webhook?") and "k=" in path:
+                masked = list(args)
+                masked[2] = path.split("&", 1)[0].split("?", 1)[0] + "?k=***"
+                record.args = tuple(masked)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_MaskWebhookToken())
+
+
 def _env_truthy(name: str) -> bool:
     """FIX(P2#12): forward-declared so the BMDEBUG check below treats
     BMDEBUG=0 as false. Previously the bare ``os.environ.get("BMDEBUG")``

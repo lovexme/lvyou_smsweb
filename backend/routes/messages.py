@@ -12,8 +12,9 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
-from backend.db import CallRecord, Device, SessionLocal, SmsRecord, get_db
+from backend.db import CallRecord, Device, SessionLocal, SmsJob, SmsRecord, get_db
 from backend.messages import (
+    KEY_BARK_URL,
     KEY_NOTIFY_SECRET,
     KEY_NOTIFY_WEBHOOK,
     KEY_WEBHOOK_TOKEN,
@@ -21,6 +22,7 @@ from backend.messages import (
     ingest_push,
     notify_sms,
     poll_device,
+    send_bark,
     send_dingtalk,
     set_setting,
 )
@@ -148,10 +150,13 @@ def api_messages_refresh(device_id: int, db: Session = Depends(get_db)):
 
 @router.get("/api/messages/notify")
 def api_notify_get(db: Session = Depends(get_db)):
+    bark_url = (get_setting(db, KEY_BARK_URL, "") or "").strip()
     return {
         "notify_configured": bool(get_setting(db, KEY_NOTIFY_WEBHOOK, "")),
         "notify_secret_configured": bool(get_setting(db, KEY_NOTIFY_SECRET, "")),
         "webhook_token_configured": bool(get_setting(db, KEY_WEBHOOK_TOKEN, "")),
+        "bark_configured": bool(bark_url),
+        "bark_host": _url_host(bark_url),
     }
 
 
@@ -168,6 +173,11 @@ async def api_notify_set(payload: Dict[str, Any], db: Session = Depends(get_db))
         set_setting(db, KEY_NOTIFY_SECRET, str(payload.get("dingtalk_secret") or "").strip())
     if "webhook_token" in payload:
         set_setting(db, KEY_WEBHOOK_TOKEN, str(payload.get("webhook_token") or "").strip())
+    if "bark_url" in payload:
+        bark_url = str(payload.get("bark_url") or "").strip()
+        if bark_url and not (bark_url.startswith("https://") or bark_url.startswith("http://")):
+            raise HTTPException(status_code=400, detail="Bark 地址必须以 http:// 或 https:// 开头")
+        set_setting(db, KEY_BARK_URL, bark_url)
     response: Dict[str, Any] = {"ok": True}
     if payload.get("rotate_webhook_token"):
         token = secrets.token_urlsafe(24)
@@ -175,7 +185,35 @@ async def api_notify_set(payload: Dict[str, Any], db: Session = Depends(get_db))
         response["webhook_token"] = token
     if payload.get("test"):
         response["test_ok"] = await asyncio.to_thread(send_dingtalk, "绿邮面板通知测试 ✅", db)
+    if payload.get("test_bark"):
+        response["test_bark_ok"] = await asyncio.to_thread(
+            send_bark, "绿邮 · 面板通知测试", "Bark 推送链路已连通 ✅", db
+        )
     return response
+
+
+def _url_host(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+        return urlsplit(url).netloc
+    except Exception:
+        return ""
+
+
+@router.get("/api/sms/jobs/{tid}")
+def api_sms_job(tid: str, db: Session = Depends(get_db)):
+    job = db.query(SmsJob).filter(SmsJob.tid == tid).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="发送任务不存在")
+    return {
+        "tid": job.tid,
+        "status": job.status,
+        "note": job.note,
+        "delivery_id": job.delivery_id,
+        "updated": job.updated,
+    }
 
 
 def _webhook_authorized(request: Request, db: Session, payload: Dict[str, Any]) -> bool:

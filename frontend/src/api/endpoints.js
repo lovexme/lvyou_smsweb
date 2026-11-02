@@ -85,6 +85,12 @@ export function sendSms(payload) {
   return api.post('/api/sms/send-direct', payload)
 }
 
+// The board answers sendsms asynchronously; this polls the job the backend
+// opened for that command to learn the real outcome.
+export function fetchSmsJob(tid) {
+  return api.get('/api/sms/jobs/' + encodeURIComponent(tid))
+}
+
 export function dialDevice(payload) {
   return api.post('/api/tel/dial', payload)
 }

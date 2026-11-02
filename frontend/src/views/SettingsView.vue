@@ -65,6 +65,35 @@
       </div>
 
       <div class="settings-card">
+        <h3>消息推送（Bark）</h3>
+        <div class="cred-form">
+          <label class="cred-row">
+            <span class="setting-label">Bark 推送地址</span>
+            <input
+              v-model="barkUrl"
+              class="cred-input"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              :placeholder="barkConfigured ? '已设置（' + barkHost + '），留空表示不修改' : 'https://…/设备Key/分组'"
+            />
+          </label>
+          <div class="cred-actions">
+            <button class="theme-toggle" :disabled="savingBark" @click="saveBark(false)">
+              <span>{{ savingBark ? '保存中…' : '保存' }}</span>
+            </button>
+            <button class="theme-toggle" :disabled="savingBark" @click="saveBark(true)">
+              <span>保存并测试</span>
+            </button>
+            <span class="cred-state" :class="{ err: barkError }">{{ barkStatus }}</span>
+          </div>
+          <p class="cred-hint">
+            收到短信、短信发出/失败/送达时推送到 iPhone。地址含设备 Key，保存后只显示域名，不会再回显完整链接。
+          </p>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>快捷键</h3>
         <div class="shortcuts-list">
           <div class="shortcut-item">
@@ -109,7 +138,12 @@ import { useRouter } from 'vue-router'
 import { useAuthStore, useDevicesStore } from '../stores'
 import { useTheme } from '../composables/useTheme'
 import { useDeviceActions } from '../composables/useDeviceActions'
-import { getDeviceCredentialSetting, saveDeviceCredentialSetting } from '../api/endpoints'
+import {
+  fetchNotifySettings,
+  getDeviceCredentialSetting,
+  saveDeviceCredentialSetting,
+  saveNotifySettings,
+} from '../api/endpoints'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -125,6 +159,66 @@ const passwordConfigured = ref(false)
 const savingCred = ref(false)
 const credStatus = ref('')
 const credError = ref(false)
+
+const barkUrl = ref('')
+const barkConfigured = ref(false)
+const barkHost = ref('')
+const savingBark = ref(false)
+const barkStatus = ref('')
+const barkError = ref(false)
+
+async function loadNotify() {
+  try {
+    const resp = await fetchNotifySettings()
+    const data = resp.data || {}
+    barkConfigured.value = !!data.bark_configured
+    barkHost.value = data.bark_host || ''
+    barkStatus.value = barkConfigured.value ? '已设置' : '未设置，短信不会推送'
+    barkError.value = !barkConfigured.value
+  } catch (e) {
+    barkStatus.value = '读取失败'
+    barkError.value = true
+  }
+}
+
+async function saveBark(withTest) {
+  if (savingBark.value) return
+  const url = String(barkUrl.value || '').trim()
+  if (!url && barkConfigured.value) {
+    barkStatus.value = '未修改'
+    barkError.value = false
+    return
+  }
+  if (!url) {
+    barkStatus.value = '请填写推送地址'
+    barkError.value = true
+    return
+  }
+  savingBark.value = true
+  barkStatus.value = '保存中…'
+  try {
+    const payload = { bark_url: url }
+    if (withTest) payload.test_bark = true
+    const resp = await saveNotifySettings(payload)
+    const data = resp.data || {}
+    barkUrl.value = ''
+    barkConfigured.value = true
+    let message = '已保存'
+    let failed = false
+    if (withTest) {
+      failed = !data.test_bark_ok
+      message = data.test_bark_ok ? '已保存，推送测试成功' : '已保存，推送测试失败'
+    }
+    await loadNotify()
+    barkError.value = failed
+    barkStatus.value = message
+  } catch (e) {
+    barkError.value = true
+    barkStatus.value = (e.response && e.response.data && e.response.data.detail) || '保存失败'
+  } finally {
+    savingBark.value = false
+  }
+}
 
 async function loadCredential() {
   try {
@@ -184,7 +278,7 @@ onMounted(async () => {
     router.push('/login')
     return
   }
-  await loadCredential()
+  await Promise.all([loadCredential(), loadNotify()])
 })
 </script>
 

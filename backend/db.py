@@ -161,6 +161,29 @@ class CallRecord(Base):
     dedup      = Column(String(40), unique=True, index=True)
 
 
+class SmsJob(Base):
+    """Track one sendsms command from local queue to the board's final report.
+
+    The board accepts sendsms asynchronously: the HTTP response is only the
+    type=401 acknowledgement, while the real result arrives later as type=402
+    (and type=502 when it reached the carrier). Keeping the job keyed by tid
+    lets the UI show that distinction instead of treating "queued" as "sent".
+    """
+    __tablename__ = "sms_jobs"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    tid         = Column(String(64), unique=True, index=True, nullable=False)
+    device_id   = Column(Integer, index=True, nullable=True)
+    dev_id      = Column(String(128), index=True, default="")
+    slot        = Column(Integer, default=1)
+    phone       = Column(String(64), default="")
+    content     = Column(Text, default="")
+    status      = Column(String(16), default="queued", index=True)
+    delivery_id = Column(String(128), default="")
+    note        = Column(String(255), default="")
+    created     = Column(BigInteger, default=0, index=True)
+    updated     = Column(BigInteger, default=0)
+
+
 def _create_all_with_retry(attempts: int = 6) -> None:
     """Create tables, tolerating the v4/v6 startup race.
 

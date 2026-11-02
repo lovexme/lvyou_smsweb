@@ -157,6 +157,34 @@ cd ..
 └── README.md
 ```
 
+## 短信回执与推送（必读）
+
+面板能显示「板子已发出 / 已提交运营商 / 发送失败」，但前提是**开发板把异步回执推给面板**。
+只在面板里点发送是不够的：`sendsms` 的 HTTP 响应只有 `type=401 / "sending..."`，
+真正的结果要靠开发板后续推送的 `402`（板子已处理）和 `502 / 503`（运营商回执）消息。
+
+每台开发板需要做两件事，都在板子的 `/ctrl` 上执行（`<TOKEN>` 是板子管理员 Token）：
+
+1. 把上报接口指向面板的 `/webhook`，带上面板生成的 Webhook Token：
+
+   ```
+   GET http://<板子IP>/ctrl?token=<TOKEN>&cmd=setinf
+       &p1=<http://面板IP:端口/webhook?k=WEBHOOK_TOKEN>&p2=post&p3=json
+   ```
+
+   用 `cmd=askinf` 复查，`method` 应为 `1`、`ctype` 应为 `1`。
+
+2. 打开 `402`、`503` 消息号上报（默认是关闭的，这是「发短信没反应」最常见的原因）：
+
+   ```
+   GET http://<板子IP>/ctrl?token=<TOKEN>&cmd=setallmsgcode&p1=402,503&p2=on&p3=replace
+   ```
+
+   用 `cmd=askallmsgcode` 复查，`en` 里应包含 `402`、`501`、`502`、`503`。
+
+面板侧在「系统设置 → 消息推送（Bark）」里填完整的 Bark 地址即可；保存后只显示域名，
+不会再回显完整链接。Webhook Token 在访问日志里会被掩码成 `k=***`。
+
 ## 安全说明
 
 - **密码要求**：默认密码为 `admin`，启动时会打印安全警告，建议通过 `lvyou pass` 更换强密码

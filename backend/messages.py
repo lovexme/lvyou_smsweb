@@ -27,7 +27,7 @@ import httpx
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from backend.db import CallRecord, Device, SessionLocal, Setting, SmsRecord
+from backend.db import CallRecord, Device, SessionLocal, Setting, SmsJob, SmsRecord
 from backend.device_client import ensure_device_token
 from backend.http_client import get_sync_client
 from backend.settings_store import device_credential
@@ -39,6 +39,7 @@ CST = timezone(timedelta(hours=8))
 KEY_NOTIFY_WEBHOOK = "dingtalk_webhook"
 KEY_NOTIFY_SECRET = "dingtalk_secret"
 KEY_WEBHOOK_TOKEN = "webhook_token"
+KEY_BARK_URL = "bark_url"
 
 POLL_INTERVAL_SECONDS = 60
 SMS_FETCH_LIMIT = 50
@@ -318,8 +319,58 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
             content=content, direction=direction, sms_ts=sms_ts, raw=data,
         )
         if inserted:
-            notify_sms(label, slot, phone, content, direction, db=db)
+            notify_sms(label, slot, phone, content, direction,
+                       msg_type=msg_type, db=db)
+        if msg_type == 502:
+            _update_sms_job(
+                db, data,
+                status="sent",
+                delivery_id=_delivery_id(data.get("smsSendMr")),
+                note="已提交运营商",
+            )
         return {"status": "ok", "stored": inserted, "id": rec_id, "type": msg_type}
+
+    if msg_type == 402 and str(data.get("subType")) == "16":
+        code = int(data.get("code") or 0)
+        if code == 0:
+            _update_sms_job(
+                db, data,
+                status="sent",
+                delivery_id=str(data.get("val") or ""),
+                note="板子已发出",
+            )
+        else:
+            reason = str(data.get("val") or data.get("note") or "发送失败")
+            reason_cn = {
+                "timeout": "运营商发送超时",
+                "cancel": "发送被取消",
+                "unknow": "发送结果未知",
+            }.get(reason, reason)
+            job = _update_sms_job(db, data, status="failed", note=reason_cn)
+            if job is not None:
+                send_bark(
+                    "绿邮 · 短信发送失败",
+                    f"{label} {job.slot}\n{job.phone}\n{reason_cn}",
+                    db=db,
+                )
+                send_dingtalk(
+                    f"⚠️ {label} 短信发送失败\n号码：{job.phone}\n原因：{reason_cn}",
+                    db=db,
+                )
+        return {"status": "ok", "type": 402, "subType": 16}
+
+    if msg_type == 503:
+        sms_st = int(data.get("smsSt") or 0)
+        job = _update_sms_job(
+            db, data,
+            status="delivered" if sms_st == 0 else "failed",
+            delivery_id=_delivery_id(data.get("smsSendMr")),
+            note="运营商确认送达" if sms_st == 0 else f"送达失败（smsSt={sms_st}）",
+        )
+        if job is not None:
+            text = ("运营商确认送达" if sms_st == 0 else f"送达失败（smsSt={sms_st}）")
+            send_bark(f"绿邮 · 短信{text}", f"{label} {job.slot}\n{job.phone}", db=db)
+        return {"status": "ok", "type": 503, "smsSt": sms_st}
 
     if msg_type in CALL_EVENT_TYPES:
         slot = f"sim{data.get('slot', 1)}"
@@ -353,7 +404,47 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
     return {"status": "ignored", "type": msg_type}
 
 
-# ── Notifications (DingTalk) ────────────────────────────────────────────
+def _delivery_id(value: Any) -> str:
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    return str(value or "")
+
+
+def _update_sms_job(
+    db: Session,
+    data: Dict[str, Any],
+    *,
+    status: str,
+    delivery_id: str = "",
+    note: str = "",
+) -> Optional[SmsJob]:
+    """Apply an asynchronous board report to the matching sendsms job.
+
+    Returns the job when its status changed, so callers can push a
+    notification exactly once even if the board retries the webhook.
+    """
+    tid = str(data.get("tid") or "").strip()
+    if not tid:
+        return None
+    job = db.query(SmsJob).filter(SmsJob.tid == tid).first()
+    if job is None:
+        return None
+    # A 402 success followed by a 502/503 must not be downgraded.
+    rank = {"queued": 0, "sent": 1, "delivered": 2, "failed": 3}
+    if rank.get(status, 0) < rank.get(job.status, 0) and status != "failed":
+        return None
+    previous = job.status
+    job.status = status
+    if delivery_id:
+        job.delivery_id = delivery_id[:128]
+    if note:
+        job.note = note[:255]
+    job.updated = int(time.time())
+    db.commit()
+    return job if previous != status else None
+
+
+# ── Notifications (DingTalk + Bark) ─────────────────────────────────────
 
 def _sign_dingtalk(webhook_url: str, secret: str) -> str:
     if not secret:
@@ -389,11 +480,51 @@ def send_dingtalk(text: str, db: Optional[Session] = None) -> bool:
         return False
 
 
+def send_bark(title: str, body: str, db: Optional[Session] = None) -> bool:
+    """Post one notification to the configured Bark URL.
+
+    Bark may answer HTTP 200 while still rejecting the request in its JSON
+    body, so both layers have to agree before this counts as delivered to the
+    push service.
+    """
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        url = (get_setting(db, KEY_BARK_URL, "") or "").strip()
+    finally:
+        if own:
+            db.close()
+    if not url:
+        return False
+    try:
+        resp = get_sync_client().post(
+            url,
+            json={"title": title, "body": body, "group": "绿邮"},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            logger.warning("bark notify HTTP %s", resp.status_code)
+            return False
+        payload = resp.json()
+        ok = isinstance(payload, dict) and int(payload.get("code") or 0) == 200
+        if not ok:
+            logger.warning("bark notify rejected: code=%s", payload.get("code") if isinstance(payload, dict) else "?")
+        return ok
+    except Exception:
+        logger.warning("bark notify failed", exc_info=True)
+        return False
+
+
 def notify_sms(dev_name: str, slot: str, phone: str, content: str,
-               direction: str, db: Optional[Session] = None) -> None:
+               direction: str, msg_type: int = 0,
+               db: Optional[Session] = None) -> None:
     emoji = "📩" if direction == "received" else "📤"
     label = "收到" if direction == "received" else "发出"
-    send_dingtalk(f"{emoji} {dev_name} {label}短信\n卡槽：{slot}\n号码：{phone}\n内容：{content}", db=db)
+    text = f"{emoji} {dev_name} {label}短信\n卡槽：{slot}\n号码：{phone}\n内容：{content}"
+    send_dingtalk(text, db=db)
+    title = "新短信" if direction == "received" else "短信已发出"
+    subtitle = "已提交运营商" if msg_type == 502 else label
+    send_bark(f"绿邮 · {title}", f"{dev_name} {slot}\n{subtitle}\n{phone}\n{content}", db=db)
 
 
 # ── Background loop ──────────────────────────────────────────────────────────
