@@ -131,9 +131,12 @@
       v-if="showDetailModal && deviceDetail"
       :detail="deviceDetail"
       :loading="loading"
+      :my-phone="myPhone"
       @update-sim1="updateDetailSim('sim1number', $event)"
       @update-sim2="updateDetailSim('sim2number', $event)"
       @update-note="updateDetailNote"
+      @update-myphone="setMyPhone"
+      @quick-dial="quickDial"
       @save="saveSimSingle"
       @save-note="saveNote"
       @detect="detectSim"
@@ -224,12 +227,15 @@ const { showConfigModal, openConfigModal } = useConfigBatch()
 const {
   showDetailModal,
   deviceDetail,
+  myPhone,
+  setMyPhone,
   closeDetailModal,
   saveSimSingle,
   updateDetailSim,
   updateDetailNote,
   saveNote,
-  detectSim
+  detectSim,
+  quickDial
 } = useDetail()
 
 const activeTab = ref('devices')

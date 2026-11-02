@@ -36,6 +36,21 @@
           <p class="sim-edit-hint">多数运营商的卡不存本机号码，读不到时手动填写即可。</p>
         </div>
         <div class="sim-edit-section">
+          <p class="sim-edit-title">快速拨打（查这张卡的本机号码）</p>
+          <input
+            :value="myPhone"
+            class="form-input"
+            inputmode="tel"
+            placeholder="我的手机号，填一次就会记住"
+            @input="emit('update-myphone', $event.target.value)"
+          />
+          <div class="sim-edit-actions">
+            <button class="btn-secondary" :disabled="loading || !myPhone" @click="emit('quick-dial', 1)">用卡1打给我</button>
+            <button class="btn-secondary" :disabled="loading || !myPhone" @click="emit('quick-dial', 2)">用卡2打给我</button>
+          </div>
+          <p class="sim-edit-hint">你手机上的来电号码就是这张卡的号码，填到上面点“保存卡号”。通话 20 秒后自动挂断。</p>
+        </div>
+        <div class="sim-edit-section">
           <p class="sim-edit-title">备注（套餐、月租、用途等）</p>
           <textarea
             :value="device.note || ''"
@@ -60,10 +75,14 @@ import { computed } from 'vue'
 
 const props = defineProps({
   detail: { type: Object, required: true },
-  loading: { type: Boolean, default: false }
+  loading: { type: Boolean, default: false },
+  myPhone: { type: String, default: '' }
 })
 
-const emit = defineEmits(['close', 'save', 'detect', 'update-sim1', 'update-sim2', 'update-note', 'save-note'])
+const emit = defineEmits([
+  'close', 'save', 'detect', 'update-sim1', 'update-sim2', 'update-note', 'save-note',
+  'update-myphone', 'quick-dial'
+])
 
 const device = computed(() => props.detail.device || {})
 
