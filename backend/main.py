@@ -509,7 +509,12 @@ _CSRF_REQUIRED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 @app.middleware("http")
 async def token_auth_mw(request: Request, call_next):
     path = request.url.path
-    if request.method == "OPTIONS" or path.startswith("/static/") or path in _PUBLIC_PATHS:
+    if (
+        request.method == "OPTIONS"
+        or path == "/static"
+        or path.startswith("/static/")
+        or path in _PUBLIC_PATHS
+    ):
         return await call_next(request)
     token, via_cookie = _extract_request_token(request)
     if not token:
