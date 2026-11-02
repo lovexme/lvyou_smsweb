@@ -434,7 +434,7 @@ def ingest_push(db: Session, data: Dict[str, Any], source_ip: str = "") -> Dict[
             reason = str(data.get("val") or data.get("note") or "发送失败")
             reason_cn = {
                 "timeout": "运营商发送超时",
-                "cancel": "发送被取消",
+                "cancel": "运营商取消发送（可能欠费停机，或该卡不支持点对点短信）",
                 "unknow": "发送结果未知",
             }.get(reason, reason)
             job = _update_sms_job(db, data, status="failed", note=reason_cn)
