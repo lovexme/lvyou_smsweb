@@ -145,10 +145,6 @@ export function setDeviceNote(deviceId, note) {
   return api.post('/api/devices/' + deviceId + '/note', { note })
 }
 
-export function autoDetectSim(deviceId) {
-  return api.post('/api/devices/' + deviceId + '/sim/auto')
-}
-
 export function deleteDeviceById(deviceId) {
   return api.delete('/api/devices/' + deviceId)
 }

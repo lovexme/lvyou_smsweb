@@ -31,9 +31,8 @@
           <input :value="device.sim2number || ''" class="form-input" placeholder="SIM2 号码" @input="emit('update-sim2', $event.target.value)" />
           <div class="sim-edit-actions">
             <button class="btn-confirm" :disabled="loading" @click="emit('save')">保存卡号</button>
-            <button class="btn-secondary" :disabled="loading" @click="emit('detect')">自动识别卡号</button>
           </div>
-          <p class="sim-edit-hint">多数运营商的卡不存本机号码，读不到时手动填写即可。</p>
+          <p class="sim-edit-hint">运营商的卡一般不在卡里存本机号码，号码要手动填，或下面用快速拨打查出来再填。</p>
         </div>
         <div class="sim-edit-section">
           <p class="sim-edit-title">快速拨打（查这张卡的本机号码）</p>
@@ -80,7 +79,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits([
-  'close', 'save', 'detect', 'update-sim1', 'update-sim2', 'update-note', 'save-note',
+  'close', 'save', 'update-sim1', 'update-sim2', 'update-note', 'save-note',
   'update-myphone', 'quick-dial'
 ])
 

@@ -368,53 +368,6 @@ def api_set_note(devid: int, req: NoteReq, db: Session = Depends(get_db)):
     return {"ok": True, "note": note}
 
 
-@router.post("/api/devices/{devid}/sim/auto")
-def api_sim_auto(devid: int, db: Session = Depends(get_db)):
-    """Try to read the SIM phone number from the board.
-
-    Carrier SIMs usually do not store MSISDN, so ``readcard`` commonly returns
-    an empty ``msIsdn``. When it does return a value we fill the panel copy;
-    otherwise the manual number stays untouched.
-    """
-    from backend.device_client import ensure_device_token
-
-    device = db.query(Device).filter(Device.id == devid).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    _ensure_device_ip_allowed_raise(device.ip)
-    token = ensure_device_token(db, device)
-    client = _get_sync_client()
-    found: Dict[int, str] = {}
-    errors: List[str] = []
-    for slot in (1, 2):
-        try:
-            resp = client.get(
-                f"http://{device.ip}/ctrl",
-                params={"token": token, "cmd": "readcard", "p1": slot},
-                timeout=TIMEOUT + 15,
-            )
-            body = resp.json() if resp.content else {}
-        except Exception as exc:
-            errors.append(f"SIM{slot}: {type(exc).__name__}")
-            continue
-        number = str(body.get("msIsdn") or "").strip()
-        if int(body.get("code") or 0) == 0 and number:
-            found[slot] = number
-    if 1 in found:
-        device.sim1number = found[1]
-    if 2 in found:
-        device.sim2number = found[2]
-    if found:
-        db.commit()
-    return {
-        "ok": True,
-        "found": bool(found),
-        "sim1": device.sim1number or "",
-        "sim2": device.sim2number or "",
-        "errors": errors,
-    }
-
-
 @router.get("/api/devices/groups")
 def apidevicesgroups(db: Session = Depends(get_db)):
     rows = (

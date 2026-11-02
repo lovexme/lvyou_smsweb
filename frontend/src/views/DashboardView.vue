@@ -139,7 +139,6 @@
       @quick-dial="quickDial"
       @save="saveSimSingle"
       @save-note="saveNote"
-      @detect="detectSim"
       @close="closeDetailModal"
     />
 
@@ -234,7 +233,6 @@ const {
   updateDetailSim,
   updateDetailNote,
   saveNote,
-  detectSim,
   quickDial
 } = useDetail()
 

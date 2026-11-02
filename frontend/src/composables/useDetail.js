@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 
-import { autoDetectSim, dialDevice, fetchDeviceDetail, saveDeviceSim, setDeviceNote } from '../api/endpoints'
+import { dialDevice, fetchDeviceDetail, saveDeviceSim, setDeviceNote } from '../api/endpoints'
 import { useDevicesStore } from '../stores'
 import { useLoading } from './useLoading'
 import { useNotice } from './useNotice'
@@ -104,27 +104,6 @@ export function useDetail() {
     }
   }
 
-  async function detectSim() {
-    const device = deviceDetail.value && deviceDetail.value.device
-    if (!device) return
-    loading.value = true
-    try {
-      const res = await autoDetectSim(device.id)
-      const data = (res && res.data) || {}
-      if (data.found) {
-        device.sim1number = data.sim1 || device.sim1number || ''
-        device.sim2number = data.sim2 || device.sim2number || ''
-        setNotice('已从板子读取到卡号', 'ok')
-      } else {
-        setNotice('板子读不到卡号（运营商未在卡里预存号码），请手动填写', 'warn')
-      }
-    } catch (e) {
-      setNotice(errText(e, '自动识别失败'), 'err')
-    } finally {
-      loading.value = false
-    }
-  }
-
   // Dial the operator's own phone from one slot: the caller ID on the phone is
   // the SIM's number, which is the only reliable way to read it when the
   // carrier does not store MSISDN on the card. 20s cap so an unanswered call
@@ -170,7 +149,6 @@ export function useDetail() {
     updateDetailSim,
     updateDetailNote,
     saveNote,
-    detectSim,
     quickDial
   }
 }
