@@ -645,13 +645,28 @@ def _bm_login_failure(reason: str) -> None:
 os.makedirs(STATICDIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATICDIR), name="static")
 
+_INDEX_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+}
 
-@app.get("/")
-def uiindex():
+
+def _index_response() -> FileResponse:
+    """Serve the SPA shell without caching.
+
+    index.html points at content-hashed chunks. If a browser keeps an old
+    copy across a deploy, it asks for chunks that no longer exist and the
+    SPA fails right after login, so the shell must always be revalidated.
+    """
     index_path = os.path.join(STATICDIR, "index.html")
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="UI not built")
-    return FileResponse(index_path)
+    return FileResponse(index_path, headers=_INDEX_HEADERS)
+
+
+@app.get("/")
+def uiindex():
+    return _index_response()
 
 
 # Network-level helpers (SSRF allowlist, ARP table, prewarm, TCP probe,
@@ -927,7 +942,4 @@ def ui_spa_fallback(full_path: str):
     # not a client-side route; returning index.html there hides 404s.
     if "." in full_path.rsplit("/", 1)[-1]:
         raise HTTPException(status_code=404, detail="Not Found")
-    index_path = os.path.join(STATICDIR, "index.html")
-    if not os.path.exists(index_path):
-        raise HTTPException(status_code=404, detail="UI not built")
-    return FileResponse(index_path)
+    return _index_response()
