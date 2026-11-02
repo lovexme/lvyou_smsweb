@@ -386,7 +386,7 @@ async def _auto_scan_loop() -> None:
             from backend.routes import scan as scan_mod
 
             cidr = getattr(scan_mod, "_guessipv4cidr", None)
-            cidr = cidr() if callable(cidr) else "192.168.68.0/24"
+            cidr = cidr() if callable(cidr) else guessipv4cidr()
             user, password = get_device_credentials()
             scan_id = _uuid.uuid4().hex[:12]
             state = scan_mod.ScanState()

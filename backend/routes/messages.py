@@ -287,9 +287,12 @@ async def api_webhook(request: Request):
     if not isinstance(data, dict):
         return {"status": "bad_request"}
     if not data.get("type"):
-        logger.info("webhook untyped ct=%s keys=%s body=%s",
-                    ct or "-", ",".join(sorted(data)[:12]) or "-",
-                    re.sub(r"\d{7,}", "***", raw[:200]).replace("\n", " "))
+        # Untyped pushes are the board's "local push" format. Keep the shape
+        # for diagnosing new firmware, but at debug level: the body carries
+        # the caller number and message text.
+        logger.debug("webhook untyped ct=%s keys=%s body=%s",
+                     ct or "-", ",".join(sorted(data)[:12]) or "-",
+                     re.sub(r"\d{7,}", "***", raw[:120]).replace("\n", " "))
 
     db = SessionLocal()
     try:
