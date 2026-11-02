@@ -792,10 +792,14 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
         device.passwd      = pw
         device.status      = "online"
         device.lastSeen    = nowts()
-        device.sim1number  = sim1num
+        # The board only reports SIM1_PHNUM when a number is written into its
+        # own SIM record; most carrier SIMs return an empty string.  Treat an
+        # empty board value as "unknown" so a number typed in the panel is not
+        # wiped by the next scan.
+        device.sim1number  = sim1num or (device.sim1number or "")
         device.sim1operator= sim1op
         device.sim1signal  = sim1sig
-        device.sim2number  = sim2num
+        device.sim2number  = sim2num or (device.sim2number or "")
         device.sim2operator= sim2op
         device.sim2signal  = sim2sig
         if fw_ver:
