@@ -29,8 +29,20 @@ UIUSER            = os.environ.get("BMUIUSER", "admin")
 # explicitly set to a non-default value (override with
 # BMINSECURE_DEFAULT_PASSWORD=1 for local development).
 UIPASS            = os.environ.get("BMUIPASS", "admin")
-# FIX(P1#10): shorten default token lifetime from 8h to 2h.
-TOKEN_TTL_SECONDS = int(os.environ.get("BMTOKENTTL", str(2 * 60 * 60)))
+# A logged-in browser session used to expire after a fixed 2 hours with no
+# renewal, which is easy to mistake for "the login breaks". Keep the lifetime
+# configurable, but default to 30 days for a self-hosted panel and slide the
+# expiry forward while the token is in use (see TOKEN_REFRESH_INTERVAL).
+TOKEN_TTL_SECONDS = int(os.environ.get("BMTOKENTTL", str(30 * 86400)))
+# Rewrite the token row (and cookie Max-Age) at most this often. Without it
+# every authenticated request would touch SQLite and re-send Set-Cookie.
+TOKEN_REFRESH_INTERVAL = max(
+    60,
+    min(
+        int(os.environ.get("BMTOKENREFRESH", str(6 * 3600))),
+        max(60, TOKEN_TTL_SECONDS // 2),
+    ),
+)
 
 # FIX(P2#1): cookie-based session + CSRF. The browser SPA authenticates
 # via an httpOnly cookie (``AUTH_COOKIE_NAME``) which JavaScript cannot

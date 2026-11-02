@@ -38,6 +38,7 @@ from backend.config import (
     SMS_MAX_LEN,
     STATICDIR,
     TIMEOUT,
+    TOKEN_REFRESH_INTERVAL,
     TOKEN_TTL_SECONDS,
     UIPASS,
     UIUSER,
@@ -47,6 +48,7 @@ from backend.db import (
     SessionLocal,
     cleanup_expired_tokens as _cleanup_expired_tokens,
     delete_token as _delete_token,
+    extend_token as _extend_token,
     get_db,
     get_token_record as _get_token_record,
     issue_token as _issue_token,
@@ -514,9 +516,19 @@ async def token_auth_mw(request: Request, call_next):
     record = _get_token_record(token)
     if not record:
         return _unauthorized_json("未登录或登录已失效")
-    if record.get("exp", 0) <= nowts():
+    now = nowts()
+    if record.get("exp", 0) <= now:
         _delete_token(token)
         return _unauthorized_json("登录已过期，请重新登录")
+    # Sliding session: once the token has been alive for
+    # TOKEN_REFRESH_INTERVAL, extend both the database row and (for browser
+    # sessions) the cookie Max-Age. A session therefore only expires after a
+    # full TOKEN_TTL_SECONDS of inactivity instead of at a fixed wall-clock
+    # time two hours after login.
+    refresh_due = record["exp"] - now <= TOKEN_TTL_SECONDS - TOKEN_REFRESH_INTERVAL
+    if refresh_due:
+        record["exp"] = now + TOKEN_TTL_SECONDS
+        _extend_token(token, record["exp"])
     # FIX(P2#1): CSRF gate. Only enforced on cookie-auth + state-changing
     # methods so that bearer-token CLIs and read-only GETs are unaffected.
     if via_cookie and request.method in _CSRF_REQUIRED_METHODS:
@@ -524,7 +536,10 @@ async def token_auth_mw(request: Request, call_next):
         expected = _csrf_for_token(token)
         if not provided or not hmac.compare_digest(provided, expected):
             return _forbidden_json("CSRF token 缺失或不匹配")
-    return await call_next(request)
+    response = await call_next(request)
+    if refresh_due and via_cookie:
+        _set_auth_cookies(response, token)
+    return response
 
 
 # FIX(P1#5): register CORS *after* the token middleware so it is the

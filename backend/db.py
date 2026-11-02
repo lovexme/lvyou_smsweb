@@ -282,6 +282,20 @@ def delete_token(token: str) -> None:
         logger.debug("token delete failed", exc_info=True)
 
 
+def extend_token(token: str, exp: int) -> None:
+    """Push a live token's expiry forward (sliding session)."""
+    if not token:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE auth_tokens SET exp = :e WHERE token = :t"),
+                {"e": int(exp), "t": token},
+            )
+    except Exception:
+        logger.debug("token extend failed", exc_info=True)
+
+
 def issue_token(username: str) -> str:
     cleanup_expired_tokens()
     token = secrets.token_urlsafe(32)
