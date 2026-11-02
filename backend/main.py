@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.orm import Session
 
 import hashlib
@@ -643,7 +644,6 @@ def _bm_login_failure(reason: str) -> None:
 
 
 os.makedirs(STATICDIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATICDIR), name="static")
 
 _INDEX_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -662,6 +662,37 @@ def _index_response() -> FileResponse:
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="UI not built")
     return FileResponse(index_path, headers=_INDEX_HEADERS)
+
+
+class SPAStaticFiles(StaticFiles):
+    """Serve the SPA shell for router paths under /static/.
+
+    The frontend is built with ``createWebHistory('/static/')``, so its real
+    URLs are /static/login, /static/dashboard and so on. Plain StaticFiles
+    returns 404 for those paths, which turns any reload or full navigation
+    into a blank page right after login. Missing extensionless paths fall
+    back to index.html; asset misses keep their 404.
+    """
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            is_shell_path = path in ("", ".", "/") or (
+                not path.startswith("assets/")
+                and "." not in path.rsplit("/", 1)[-1]
+            )
+            if (
+                exc.status_code == 404
+                and is_shell_path
+            ):
+                response = await super().get_response("index.html", scope)
+                response.headers.update(_INDEX_HEADERS)
+                return response
+            raise
+
+
+app.mount("/static", SPAStaticFiles(directory=STATICDIR), name="static")
 
 
 @app.get("/")
