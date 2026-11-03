@@ -691,9 +691,11 @@ def notify_sms(dev_name: str, slot: str, phone: str, content: str,
     text = f"{emoji} {dev_name} {label}短信\n卡槽：{_display_sim(slot, sim_number)}\n号码：{phone}\n内容：{content}"
     _run_async(send_dingtalk, text)
     title = "新短信" if direction == "received" else "短信已发出"
-    subtitle = "已提交运营商" if msg_type == 502 else label
+    # The peer number goes first: iOS only previews the first couple of body
+    # lines when the banner is collapsed, and a board whose own number is not
+    # filled in yet used to push a preview with no number at all.
     _run_async(send_bark, f"绿邮 · {title}",
-               f"{dev_name} · {_display_sim(slot, sim_number)}\n{subtitle}\n{phone}\n{content}")
+               f"{phone}\n{dev_name} · {_display_sim(slot, sim_number)}\n{content}")
 
 
 def _notify_call(dev_name: str, slot: str, phone: str, *, title: str,
