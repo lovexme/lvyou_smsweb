@@ -28,6 +28,7 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -86,6 +87,12 @@ class Device(Base):
     # overwrites the device's stable identifier (devId).
     firmware_version = Column(String(64), default="")
     alias        = Column(String(128), default="")
+    # Manual ordering for the dashboard list (lower first). 0 means "not
+    # ordered yet", which keeps the historical newest-first ordering until the
+    # operator drags a card.
+    sort_order   = Column(Integer,     default=0)
+    # Free-form operator note (carrier plan, monthly fee, spare SIM, ...).
+    note         = Column(Text,        default="")
     created      = Column(String(32),  default="")
 
 
@@ -112,7 +119,96 @@ class RateEvent(Base):
     ts    = Column(Integer,     index=True, nullable=False)
 
 
-Base.metadata.create_all(bind=engine)
+# Runtime settings (currently the board admin credential). Kept in SQLite so
+# the v4 and v6 uvicorn processes agree and a restart keeps the value, and so
+# the UI can set it once instead of every code path hard-coding DEFAULTPASS.
+class Setting(Base):
+    __tablename__ = "settings"
+    key   = Column(String(64), primary_key=True)
+    value = Column(Text, default="")
+
+
+# SMS/call history pulled from the boards or pushed to /webhook. The old
+# lvyou-panel kept these in its own SQLite file; they live here so the whole
+# fleet is visible from one place and survives restarts.
+class SmsRecord(Base):
+    __tablename__ = "sms_records"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    device_id  = Column(Integer, index=True, nullable=True)
+    dev_id     = Column(String(128), index=True, default="")
+    sim_slot   = Column(String(16), default="")
+    phone      = Column(String(64), default="", index=True)
+    content    = Column(Text, default="")
+    direction  = Column(String(16), default="received", index=True)
+    raw_json   = Column(Text, default="")
+    sms_ts     = Column(BigInteger, default=0, index=True)
+    sms_time   = Column(String(32), default="")
+    created    = Column(String(32), default="")
+    # sha1(device|ts|slot|direction|phone|content): INSERT OR IGNORE makes
+    # polling and webhook delivery idempotent even when both arrive for the
+    # same message.
+    dedup      = Column(String(40), unique=True, index=True)
+
+
+class CallRecord(Base):
+    __tablename__ = "call_records"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    device_id  = Column(Integer, index=True, nullable=True)
+    dev_id     = Column(String(128), index=True, default="")
+    sim_slot   = Column(String(16), default="")
+    phone      = Column(String(64), default="", index=True)
+    direction  = Column(String(16), default="incoming", index=True)
+    action     = Column(String(16), default="")
+    duration   = Column(Integer, default=0)
+    raw_json   = Column(Text, default="")
+    call_time  = Column(String(32), default="")
+    start_ts   = Column(BigInteger, default=0, index=True)
+    created    = Column(String(32), default="")
+    dedup      = Column(String(40), unique=True, index=True)
+
+
+class SmsJob(Base):
+    """Track one sendsms command from local queue to the board's final report.
+
+    The board accepts sendsms asynchronously: the HTTP response is only the
+    type=401 acknowledgement, while the real result arrives later as type=402
+    (and type=502 when it reached the carrier). Keeping the job keyed by tid
+    lets the UI show that distinction instead of treating "queued" as "sent".
+    """
+    __tablename__ = "sms_jobs"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    tid         = Column(String(64), unique=True, index=True, nullable=False)
+    device_id   = Column(Integer, index=True, nullable=True)
+    dev_id      = Column(String(128), index=True, default="")
+    slot        = Column(Integer, default=1)
+    phone       = Column(String(64), default="")
+    content     = Column(Text, default="")
+    status      = Column(String(16), default="queued", index=True)
+    delivery_id = Column(String(128), default="")
+    note        = Column(String(255), default="")
+    created     = Column(BigInteger, default=0, index=True)
+    updated     = Column(BigInteger, default=0)
+
+
+def _create_all_with_retry(attempts: int = 6) -> None:
+    """Create tables, tolerating the v4/v6 startup race.
+
+    The entrypoint starts two uvicorn processes that both import this module.
+    When a new table is introduced they can run CREATE TABLE at the same
+    instant and the loser dies with "table ... already exists" -- which is
+    exactly what happened when the settings table was added.
+    """
+    for attempt in range(attempts):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError as exc:
+            if "already exists" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
+
+_create_all_with_retry()
 
 
 def run_migrations() -> None:
@@ -122,6 +218,8 @@ def run_migrations() -> None:
         ("devices", "sim1signal",       "INTEGER DEFAULT 0"),
         ("devices", "sim2signal",       "INTEGER DEFAULT 0"),
         ("devices", "firmware_version", "VARCHAR(64) DEFAULT ''"),
+        ("devices", "sort_order",       "INTEGER DEFAULT 0"),
+        ("devices", "note",             "TEXT DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, coltype in alters:
@@ -190,6 +288,20 @@ def delete_token(token: str) -> None:
             conn.execute(text("DELETE FROM auth_tokens WHERE token = :t"), {"t": token})
     except Exception:
         logger.debug("token delete failed", exc_info=True)
+
+
+def extend_token(token: str, exp: int) -> None:
+    """Push a live token's expiry forward (sliding session)."""
+    if not token:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE auth_tokens SET exp = :e WHERE token = :t"),
+                {"e": int(exp), "t": token},
+            )
+    except Exception:
+        logger.debug("token extend failed", exc_info=True)
 
 
 def issue_token(username: str) -> str:

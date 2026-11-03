@@ -85,8 +85,44 @@ export function sendSms(payload) {
   return api.post('/api/sms/send-direct', payload)
 }
 
+// The board answers sendsms asynchronously; this polls the job the backend
+// opened for that command to learn the real outcome.
+export function fetchSmsJob(tid) {
+  return api.get('/api/sms/jobs/' + encodeURIComponent(tid))
+}
+
 export function dialDevice(payload) {
   return api.post('/api/tel/dial', payload)
+}
+
+export async function fetchSmsHistory({ page = 1, pageSize = 30, q = '', direction = '', deviceId = 0 } = {}) {
+  const params = { page, page_size: pageSize }
+  if (q) params.q = q
+  if (direction) params.direction = direction
+  if (deviceId) params.device_id = deviceId
+  const resp = await api.get('/api/messages/sms', { params })
+  return resp.data || {}
+}
+
+export async function fetchCallHistory({ page = 1, pageSize = 30, q = '', direction = '', deviceId = 0 } = {}) {
+  const params = { page, page_size: pageSize }
+  if (q) params.q = q
+  if (direction) params.direction = direction
+  if (deviceId) params.device_id = deviceId
+  const resp = await api.get('/api/messages/calls', { params })
+  return resp.data || {}
+}
+
+export function refreshMessages(deviceId) {
+  return api.post('/api/messages/refresh/' + deviceId)
+}
+
+export function fetchNotifySettings() {
+  return api.get('/api/messages/notify')
+}
+
+export function saveNotifySettings(payload) {
+  return api.post('/api/messages/notify', payload)
 }
 
 export function setDeviceAlias(deviceId, alias) {
@@ -97,8 +133,26 @@ export function setDeviceGroup(deviceId, group) {
   return api.post('/api/devices/' + deviceId + '/group', { group })
 }
 
+export function moveDevice(deviceId, payload) {
+  return api.post('/api/devices/' + deviceId + '/move', payload)
+}
+
+export function reorderDevices(ids) {
+  return api.post('/api/devices/reorder', { ids })
+}
+
+export function setDeviceNote(deviceId, note) {
+  return api.post('/api/devices/' + deviceId + '/note', { note })
+}
+
 export function deleteDeviceById(deviceId) {
   return api.delete('/api/devices/' + deviceId)
+}
+
+// Point the boards at this panel's /webhook and turn on the 402/5xx/6xx
+// report codes, so SMS results and call events actually reach the dashboard.
+export function setupDevicePush(deviceIds) {
+  return api.post('/api/devices/push/setup', { device_ids: deviceIds })
 }
 
 export function checkOtaBatch(deviceIds) {
@@ -147,4 +201,17 @@ export function fetchDeviceDetail(deviceId) {
 
 export function saveDeviceSim(deviceId, payload) {
   return api.post('/api/devices/' + deviceId + '/sim', payload)
+}
+
+// ── panel-wide settings ──────────────────────────────────────────────────────
+export function getDeviceCredentialSetting() {
+  return api.get('/api/settings/device')
+}
+
+export function saveDeviceCredentialSetting(payload) {
+  return api.post('/api/settings/device', payload)
+}
+
+export function probeDeviceCredential(payload) {
+  return api.post('/api/settings/device/probe', payload)
 }

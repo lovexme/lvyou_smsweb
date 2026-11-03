@@ -15,13 +15,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
-from backend.config import (
-    CIDRFALLBACKLIMIT,
-    DEFAULTPASS,
-    DEFAULTUSER,
-    SCAN_TTL,
-)
+from backend.config import CIDRFALLBACKLIMIT, SCAN_TTL
 from backend.db import SessionLocal
+from backend.settings_store import get_device_credentials
 
 logger = logging.getLogger("board-manager")
 
@@ -228,7 +224,7 @@ def _run_scan_bg(scan_id: str, cidr: str, group: Optional[str], user: str, passw
             failed: List[Dict[str, Any]] = []
             for item in state.results:
                 try:
-                    d = _upsertdevice(db, item["ip"], item["mac"], DEFAULTUSER, DEFAULTPASS, item.get("grp"))
+                    d = _upsertdevice(db, item["ip"], item["mac"], user, password, item.get("grp"))
                     if d.get("error"):
                         failed.append(d)
                     else:
@@ -272,8 +268,9 @@ def _submit_scan(cidr: Optional[str], group: Optional[str], user: str, password:
 
 @router.post("/api/scan/start")
 def scanstart(req: ScanStartReq, background_tasks: BackgroundTasks):
-    user = req.user.strip() or DEFAULTUSER
-    password = req.password.strip() or DEFAULTPASS
+    default_user, default_pass = get_device_credentials()
+    user = req.user.strip() or default_user
+    password = req.password or default_pass
     scan_id = _submit_scan(req.cidr, req.group, user, password, background_tasks)
     return {"ok": True, "scanId": scan_id}
 

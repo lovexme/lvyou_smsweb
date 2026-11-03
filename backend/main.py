@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.orm import Session
 
 import hashlib
@@ -30,8 +31,6 @@ from backend.config import (
     COOKIE_SECURE,
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
-    DEFAULTPASS,
-    DEFAULTUSER,
     FORWARD_METHOD_BASIC,
     OTA_BATCH_MAX,
     SCAN_RETRIES,
@@ -40,6 +39,7 @@ from backend.config import (
     SMS_MAX_LEN,
     STATICDIR,
     TIMEOUT,
+    TOKEN_REFRESH_INTERVAL,
     TOKEN_TTL_SECONDS,
     UIPASS,
     UIUSER,
@@ -49,6 +49,7 @@ from backend.db import (
     SessionLocal,
     cleanup_expired_tokens as _cleanup_expired_tokens,
     delete_token as _delete_token,
+    extend_token as _extend_token,
     get_db,
     get_token_record as _get_token_record,
     issue_token as _issue_token,
@@ -76,6 +77,12 @@ from backend.http_client import (
 )
 from backend.audit import audit as _audit
 from backend.ratelimit import RateLimiter, max_period_seen as _rate_max_period
+from backend.settings_store import (
+    device_credential,
+    device_credentials_configured,
+    get_device_credentials,
+    set_device_credentials,
+)
 from backend.device_client import (
     ensure_device_ip_allowed as _ensure_device_ip_allowed,
     istargetdevice,
@@ -93,6 +100,34 @@ from backend.db import cleanup_rate_events as _cleanup_rate_events
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("board-manager")
+
+
+class _MaskWebhookToken(logging.Filter):
+    """Strip the board webhook token from uvicorn's access log.
+
+    The token has to travel in the query string (``/webhook?k=...``) because
+    the board's setinf command can only configure a URL, method and
+    Content-Type -- it cannot send a custom header. Uvicorn logs the full
+    request line, so the secret would otherwise end up in plain text in
+    ``docker logs``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = args[2]
+            if isinstance(path, str) and path.startswith("/webhook?") and "k=" in path:
+                masked = list(args)
+                masked[2] = path.split("&", 1)[0].split("?", 1)[0] + "?k=***"
+                record.args = tuple(masked)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_MaskWebhookToken())
+
+# httpx logs every request URL at INFO, and the Bark URL *is* the credential
+# (device key in the path). Keep the library quiet unless something fails.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _env_truthy(name: str) -> bool:
@@ -283,6 +318,18 @@ _cleanup_task: Optional["asyncio.Task"] = None
 # seen for STALE_DEVICE_TTL seconds (default 7 days) so they don't pile up.
 STALE_DEVICE_TTL = int(os.environ.get("BMSTALEDEVICETTL", str(7 * 86400)))
 
+# The entrypoint runs two uvicorn listeners (IPv4 + IPv6) over the same app and
+# the same SQLite database. Background tasks (LAN auto-scan, message polling,
+# cleanup) must run in exactly one of them, otherwise every board is scanned
+# and polled twice per interval. BMWORKER=0 turns this listener into a pure
+# front end; a single-listener deployment keeps the default (enabled).
+_BACKGROUND_WORKER = os.environ.get("BMWORKER", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
 
 def _cleanup_stale_devices() -> None:
     db = SessionLocal()
@@ -322,6 +369,41 @@ async def _scan_cleanup_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _auto_scan_loop() -> None:
+    """Periodic LAN scan so a newly plugged-in board joins without a click.
+
+    BMAUTOSCAN=0 disables it; BMAUTOSCANINTERVAL sets the period (seconds,
+    clamped to 5..120 minutes). The scan runs the same worker as the manual
+    button, so credentials, dedup and the device upsert path are shared.
+    """
+    if os.environ.get("BMAUTOSCAN", "1").strip() in ("0", "false", "False", "no"):
+        return
+    try:
+        interval = int(os.environ.get("BMAUTOSCANINTERVAL", "900") or 900)
+    except ValueError:
+        interval = 900
+    interval = max(300, min(interval, 7200))
+    await asyncio.sleep(90)
+    while True:
+        try:
+            from backend.routes import scan as scan_mod
+
+            cidr = getattr(scan_mod, "_guessipv4cidr", None)
+            cidr = cidr() if callable(cidr) else guessipv4cidr()
+            user, password = get_device_credentials()
+            scan_id = _uuid.uuid4().hex[:12]
+            state = scan_mod.ScanState()
+            state.set_cidr(cidr)
+            with scan_mod._active_scans_lock:
+                scan_mod._active_scans[scan_id] = state
+            logger.info("auto-scan start %s", cidr)
+            await asyncio.to_thread(scan_mod._run_scan_bg, scan_id, cidr, "auto", user, password)
+            logger.info("auto-scan done: %s", state.progress)
+        except Exception:
+            logger.debug("auto-scan failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _cleanup_task
@@ -332,12 +414,33 @@ async def lifespan(app: FastAPI):
     sync_client, executor = _init_runtime()
     app.state.sync_http_client = sync_client
     app.state.executor = executor
-    # FIX(P1#12): periodic cleanup task for finished scans, expired tokens,
-    # rate-limit events and stale device rows.
-    _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+    _auto_scan_task: Optional["asyncio.Task"] = None
+    _messages_task: Optional["asyncio.Task"] = None
+    if _BACKGROUND_WORKER:
+        # FIX(P1#12): periodic cleanup task for finished scans, expired tokens,
+        # rate-limit events and stale device rows.
+        _cleanup_task = asyncio.create_task(_scan_cleanup_loop())
+        _auto_scan_task = asyncio.create_task(_auto_scan_loop())
+        # SMS / call catch-up poller; the webhook path delivers real-time events.
+        from backend.messages import messages_poll_loop as _messages_poll_loop
+        _messages_task = asyncio.create_task(_messages_poll_loop())
+    else:
+        logger.info("background tasks disabled on this listener (BMWORKER=0)")
     try:
         yield
     finally:
+        if _messages_task:
+            _messages_task.cancel()
+            try:
+                await _messages_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if _auto_scan_task:
+            _auto_scan_task.cancel()
+            try:
+                await _auto_scan_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if _cleanup_task:
             _cleanup_task.cancel()
             try:
@@ -379,7 +482,22 @@ def _configure_cors(_app: FastAPI) -> None:
 # only when BMMETRICS_TOKEN is set. Leaving it out when metrics are
 # disabled means the main token_auth_mw still rejects requests instead
 # of letting them fall through to a confusing 404.
-_PUBLIC_PATHS = {"/", "/api/login", "/api/health"}
+# /webhook is called by the boards themselves (LAN sources, validated inside
+# the route by a shared token and/or the device IP allow-list).
+#
+# The SPA routes are public as *documents*: the browser has to load the app
+# shell before the router guard can redirect an unauthenticated visitor to
+# /login. They expose no data by themselves -- every /api call behind them
+# still requires a token.
+_SPA_PATHS = {
+    "/login",
+    "/dashboard",
+    "/numbers",
+    "/settings",
+    "/messages",
+    "/calls",
+}
+_PUBLIC_PATHS = {"/", "/api/login", "/api/health", "/webhook"} | _SPA_PATHS
 
 # FIX(P2#1): methods that mutate state and therefore must carry a valid
 # X-CSRF-Token header when the caller authenticated via a cookie. Bearer-
@@ -391,7 +509,12 @@ _CSRF_REQUIRED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 @app.middleware("http")
 async def token_auth_mw(request: Request, call_next):
     path = request.url.path
-    if request.method == "OPTIONS" or path.startswith("/static/") or path in _PUBLIC_PATHS:
+    if (
+        request.method == "OPTIONS"
+        or path == "/static"
+        or path.startswith("/static/")
+        or path in _PUBLIC_PATHS
+    ):
         return await call_next(request)
     token, via_cookie = _extract_request_token(request)
     if not token:
@@ -399,9 +522,19 @@ async def token_auth_mw(request: Request, call_next):
     record = _get_token_record(token)
     if not record:
         return _unauthorized_json("未登录或登录已失效")
-    if record.get("exp", 0) <= nowts():
+    now = nowts()
+    if record.get("exp", 0) <= now:
         _delete_token(token)
         return _unauthorized_json("登录已过期，请重新登录")
+    # Sliding session: once the token has been alive for
+    # TOKEN_REFRESH_INTERVAL, extend both the database row and (for browser
+    # sessions) the cookie Max-Age. A session therefore only expires after a
+    # full TOKEN_TTL_SECONDS of inactivity instead of at a fixed wall-clock
+    # time two hours after login.
+    refresh_due = record["exp"] - now <= TOKEN_TTL_SECONDS - TOKEN_REFRESH_INTERVAL
+    if refresh_due:
+        record["exp"] = now + TOKEN_TTL_SECONDS
+        _extend_token(token, record["exp"])
     # FIX(P2#1): CSRF gate. Only enforced on cookie-auth + state-changing
     # methods so that bearer-token CLIs and read-only GETs are unaffected.
     if via_cookie and request.method in _CSRF_REQUIRED_METHODS:
@@ -409,7 +542,10 @@ async def token_auth_mw(request: Request, call_next):
         expected = _csrf_for_token(token)
         if not provided or not hmac.compare_digest(provided, expected):
             return _forbidden_json("CSRF token 缺失或不匹配")
-    return await call_next(request)
+    response = await call_next(request)
+    if refresh_due and via_cookie:
+        _set_auth_cookies(response, token)
+    return response
 
 
 # FIX(P1#5): register CORS *after* the token middleware so it is the
@@ -513,15 +649,60 @@ def _bm_login_failure(reason: str) -> None:
 
 
 os.makedirs(STATICDIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATICDIR), name="static")
+
+_INDEX_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+
+def _index_response() -> FileResponse:
+    """Serve the SPA shell without caching.
+
+    index.html points at content-hashed chunks. If a browser keeps an old
+    copy across a deploy, it asks for chunks that no longer exist and the
+    SPA fails right after login, so the shell must always be revalidated.
+    """
+    index_path = os.path.join(STATICDIR, "index.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="UI not built")
+    return FileResponse(index_path, headers=_INDEX_HEADERS)
+
+
+class SPAStaticFiles(StaticFiles):
+    """Serve the SPA shell for router paths under /static/.
+
+    The frontend is built with ``createWebHistory('/static/')``, so its real
+    URLs are /static/login, /static/dashboard and so on. Plain StaticFiles
+    returns 404 for those paths, which turns any reload or full navigation
+    into a blank page right after login. Missing extensionless paths fall
+    back to index.html; asset misses keep their 404.
+    """
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            is_shell_path = path in ("", ".", "/") or (
+                not path.startswith("assets/")
+                and "." not in path.rsplit("/", 1)[-1]
+            )
+            if (
+                exc.status_code == 404
+                and is_shell_path
+            ):
+                response = await super().get_response("index.html", scope)
+                response.headers.update(_INDEX_HEADERS)
+                return response
+            raise
+
+
+app.mount("/static", SPAStaticFiles(directory=STATICDIR), name="static")
 
 
 @app.get("/")
 def uiindex():
-    index_path = os.path.join(STATICDIR, "index.html")
-    if not os.path.exists(index_path):
-        raise HTTPException(status_code=404, detail="UI not built")
-    return FileResponse(index_path)
+    return _index_response()
 
 
 # Network-level helpers (SSRF allowlist, ARP table, prewarm, TCP probe,
@@ -541,8 +722,8 @@ def _device_conn_info(device: Device) -> Dict[str, Any]:
         "ip": device.ip,
         "alias": device.alias or "",
         "grp": device.grp or "auto",
-        "user": (device.user or DEFAULTUSER).strip(),
-        "pw":   (device.passwd or DEFAULTPASS).strip(),
+        "user": device_credential(device)[0],
+        "pw":   device_credential(device)[1],
     }
 
 def _device_to_dict(device: Device) -> Dict[str, Any]:
@@ -557,6 +738,8 @@ def _device_to_dict(device: Device) -> Dict[str, Any]:
         "lastSeen":device.lastSeen or 0,
         "created": device.created or "",
         "firmwareVersion": getattr(device, "firmware_version", "") or "",
+        "sortOrder": getattr(device, "sort_order", 0) or 0,
+        "note":      getattr(device, "note", "") or "",
         "sims": {
             "sim1": {"number": device.sim1number or "", "operator": device.sim1operator or "", "signal": device.sim1signal or 0, "label": device.sim1number or device.sim1operator or "SIM"},
             "sim2": {"number": device.sim2number or "", "operator": device.sim2operator or "", "signal": device.sim2signal or 0, "label": device.sim2number or device.sim2operator or "SIM"},
@@ -611,21 +794,30 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
         device.passwd      = pw
         device.status      = "online"
         device.lastSeen    = nowts()
-        device.sim1number  = sim1num
+        # The board only reports SIM1_PHNUM when a number is written into its
+        # own SIM record; most carrier SIMs return an empty string.  Treat an
+        # empty board value as "unknown" so a number typed in the panel is not
+        # wiped by the next scan.
+        device.sim1number  = sim1num or (device.sim1number or "")
         device.sim1operator= sim1op
         device.sim1signal  = sim1sig
-        device.sim2number  = sim2num
+        device.sim2number  = sim2num or (device.sim2number or "")
         device.sim2operator= sim2op
         device.sim2signal  = sim2sig
         if fw_ver:
             device.firmware_version = fw_ver
     else:
+        # New boards go to the end of the operator's manual order instead of
+        # jumping to the top of the dashboard.
+        last = db.query(Device).order_by(Device.sort_order.desc()).first()
+        next_order = ((last.sort_order or 0) if last else 0) + 1
         device = Device(
             devId=devid, grp=(grp if grp is not None and str(grp).strip() else "auto"),
             ip=ip, mac=mac, user=user, passwd=pw, status="online", lastSeen=nowts(),
             sim1number=sim1num, sim1operator=sim1op, sim1signal=sim1sig,
             sim2number=sim2num, sim2operator=sim2op, sim2signal=sim2sig,
             firmware_version=fw_ver,
+            sort_order=next_order,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         db.add(device)
@@ -645,7 +837,11 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: Option
 # plus an SSRF amplifier); real-time status now happens via explicit
 # /detail / /refresh endpoints or the scan flow.
 def listdevices(db: Session) -> List[Dict[str, Any]]:
-    devices = db.query(Device).order_by(Device.created.desc(), Device.id.desc()).all()
+    devices = (
+        db.query(Device)
+        .order_by(Device.sort_order.asc(), Device.created.desc(), Device.id.desc())
+        .all()
+    )
     return [_device_to_dict(d) for d in devices]
 
 
@@ -673,6 +869,8 @@ from backend.routes.auth import router as auth_router
 from backend.routes.devices import router as devices_router
 from backend.routes.scan import router as scan_router
 from backend.routes.config import router as config_router
+from backend.routes.settings import router as settings_router
+from backend.routes.messages import router as messages_router
 from backend.routes import auth as _auth_mod
 from backend.routes import devices as _devices_mod
 from backend.routes import scan as _scan_mod
@@ -743,6 +941,8 @@ app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(scan_router)
 app.include_router(config_router)
+app.include_router(settings_router)
+app.include_router(messages_router)
 
 # ── Device query helpers (used by routes) ────────────────────────────────────
 # NOTE: getallnumbers() is defined once, earlier in this module. It filters
@@ -778,3 +978,19 @@ def _escape_like(value: str) -> str:
 # _ota_check / check_ota_task / upgrade_ota_task / ensure_device_token /
 # fetch_device_token now live in backend.device_client and are re-imported above
 # under their original names (the devices router imports them lazily from here).
+
+
+# The SPA is built with createWebHistory(), so /messages and friends are real
+# URLs. Without this fallback a browser refresh (or any deep link) hit the
+# auth middleware / 404 instead of the app shell. It MUST stay the last route
+# registered: FastAPI matches in registration order, so a catch-all declared
+# before include_router() would swallow every /api path.
+@app.get("/{full_path:path}", include_in_schema=False)
+def ui_spa_fallback(full_path: str):
+    if full_path.startswith(("api/", "static/")):
+        raise HTTPException(status_code=404, detail="Not Found")
+    # A path that looks like an asset (has an extension) is a genuine miss,
+    # not a client-side route; returning index.html there hides 404s.
+    if "." in full_path.rsplit("/", 1)[-1]:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _index_response()

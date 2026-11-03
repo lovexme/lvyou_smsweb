@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -14,9 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
-from backend.config import BATCH_MAX, DEFAULTPASS, DEFAULTUSER, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
-from backend.db import Device, SessionLocal, get_db, nowts
+from backend.config import BATCH_MAX, OTA_BATCH_MAX, SMS_MAX_LEN, TIMEOUT
+from backend.db import Device, SessionLocal, SmsJob, get_db, nowts
+from backend.settings_store import device_credential
 from backend.security import is_device_ip_allowed as _is_device_ip_allowed
+from backend.security import panel_base_url_for
 
 logger = logging.getLogger("board-manager")
 
@@ -158,6 +162,31 @@ class BatchDeleteReq(BaseModel):
     device_ids: List[int]
 
 
+class MoveReq(BaseModel):
+    # Either drop before an explicit device (drag & drop) or step one slot.
+    before: Optional[int] = None
+    direction: Optional[str] = None
+
+
+class ReorderReq(BaseModel):
+    ids: List[int]
+
+
+class NoteReq(BaseModel):
+    note: str = ""
+
+
+# Message codes a board must report for the panel to show real results.
+# 402 is the async command result (the SMS "sending..." reply alone never
+# says whether it worked), 501/502/503 are inbound SMS, outbound SMS and the
+# carrier report, and 601-623 are the call states the dashboard lists.
+PUSH_MSG_CODES = "402,501,502,503,601,602,603,620,621,622,623"
+
+
+class PushSetupReq(BaseModel):
+    device_ids: List[int]
+
+
 class BatchWifiReq(BaseModel):
     device_ids: List[int]
     ssid: str
@@ -254,7 +283,9 @@ def apidevices(
     db: Session = Depends(get_db),
 ):
     from backend.main import _apply_devices_filter
-    query = db.query(Device).order_by(Device.created.desc(), Device.id.desc())
+    query = db.query(Device).order_by(
+        Device.sort_order.asc(), Device.created.desc(), Device.id.desc()
+    )
     query = _apply_devices_filter(query, q, group)
     total = query.count()
     online = query.filter(Device.status == "online").count()
@@ -268,6 +299,73 @@ def apidevices(
         "page_size": page_size,
         "pages": (total + page_size - 1) // page_size if total else 0,
     }
+
+
+def _ordered_devices(db: Session) -> List[Device]:
+    return (
+        db.query(Device)
+        .order_by(Device.sort_order.asc(), Device.created.desc(), Device.id.desc())
+        .all()
+    )
+
+
+def _renumber(db: Session, devices: List[Device]) -> None:
+    for index, item in enumerate(devices, start=1):
+        item.sort_order = index
+    db.commit()
+
+
+# NOTE: declared before the /api/devices/{devid}/... routes so a literal
+# "reorder" path can never be parsed as a numeric device id.
+@router.post("/api/devices/reorder")
+def api_reorder_devices(req: ReorderReq, db: Session = Depends(get_db)):
+    devices = _ordered_devices(db)
+    known = {d.id for d in devices}
+    ids = [int(i) for i in req.ids]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=400, detail="排序列表包含重复设备")
+    if set(ids) != known:
+        raise HTTPException(status_code=400, detail="排序列表必须包含全部设备")
+    by_id = {d.id: d for d in devices}
+    _renumber(db, [by_id[i] for i in ids])
+    _audit("devices_reorder", detail=",".join(str(i) for i in ids))
+    return {"ok": True, "ids": ids}
+
+
+@router.post("/api/devices/{devid}/move")
+def api_move_device(devid: int, req: MoveReq, db: Session = Depends(get_db)):
+    devices = _ordered_devices(db)
+    index = next((i for i, d in enumerate(devices) if d.id == devid), None)
+    if index is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    device = devices.pop(index)
+    if req.before is not None:
+        target = next((i for i, d in enumerate(devices) if d.id == req.before), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="目标设备不存在")
+        devices.insert(target, device)
+    elif req.direction in ("up", "down"):
+        step = -1 if req.direction == "up" else 1
+        devices.insert(max(0, min(len(devices), index + step)), device)
+    else:
+        raise HTTPException(status_code=400, detail="需要 before 或 direction")
+    _renumber(db, devices)
+    _audit("device_move", detail=f"device={devid} before={req.before} dir={req.direction}")
+    return {"ok": True, "order": [d.id for d in devices]}
+
+
+@router.post("/api/devices/{devid}/note")
+def api_set_note(devid: int, req: NoteReq, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == devid).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    note = (req.note or "").strip()
+    if len(note) > 300:
+        raise HTTPException(status_code=400, detail="备注最多 300 字")
+    device.note = note
+    db.commit()
+    _audit("device_note", detail=f"device={devid}")
+    return {"ok": True, "note": note}
 
 
 @router.get("/api/devices/groups")
@@ -323,7 +421,8 @@ def api_device_detail(devid: int, db: Session = Depends(get_db)):
     payload["sim2number"] = device.sim2number or ""
     payload["sim2operator"] = device.sim2operator or ""
     payload["sim2signal"] = device.sim2signal or 0
-    sig_data = getdevicedata(device.ip, device.user or DEFAULTUSER, device.passwd or DEFAULTPASS) or {}
+    user, pw = device_credential(device)
+    sig_data = getdevicedata(device.ip, user, pw) or {}
     payload["wifiName"] = sig_data.get("WIFI_NAME", "")
     payload["wifiDbm"] = sig_data.get("WIFI_DBM", "")
     return {"device": payload, "forwardconfig": {}, "wifilist": []}
@@ -378,6 +477,114 @@ def api_batch_delete(req: BatchDeleteReq, db: Session = Depends(get_db)):
 
 # ── SMS / Dial ───────────────────────────────────────────────────────────────
 
+
+@router.post("/api/devices/push/setup")
+def api_push_setup(req: PushSetupReq, db: Session = Depends(get_db)):
+    """Point the selected boards at this panel and enable the report codes.
+
+    A board that only has the panel's IP added still sends nothing back: its
+    main report interface may point anywhere, and 402 (command result) is
+    disabled by default. Both are one /ctrl call each, so the UI exposes them
+    as a single button instead of asking the operator to hand-edit boards.
+    """
+    ids = req.device_ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="device_ids required")
+    if len(ids) > BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"一次最多处理 {BATCH_MAX} 台设备")
+
+    from backend.messages import KEY_WEBHOOK_TOKEN, get_setting, set_setting
+
+    token = (get_setting(db, KEY_WEBHOOK_TOKEN, "") or "").strip()
+    token_created = False
+    if not token:
+        token = secrets.token_urlsafe(24)
+        set_setting(db, KEY_WEBHOOK_TOKEN, token)
+        token_created = True
+
+    client = _get_sync_client()
+    wanted = [int(x) for x in PUSH_MSG_CODES.split(",")]
+    items: List[Dict[str, Any]] = []
+    from backend.device_client import ensure_device_token
+
+    for device in db.query(Device).filter(Device.id.in_(ids)).all():
+        item: Dict[str, Any] = {
+            "device_id": device.id,
+            "devId": device.devId or "",
+            "ip": device.ip,
+            "ok": False,
+        }
+        try:
+            base = panel_base_url_for(device.ip)
+            webhook_url = f"{base}/webhook?k={token}"
+            item["panel"] = base
+            dtok = ensure_device_token(db, device)
+
+            def ctrl(**params: Any):
+                resp = client.get(
+                    f"http://{device.ip}/ctrl",
+                    params={"token": dtok, **params},
+                    timeout=TIMEOUT + 5,
+                )
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                return resp.status_code, body
+
+            _, setinf = ctrl(cmd="setinf", p1=webhook_url, p2="post", p3="json")
+            if int(setinf.get("code") or 0) != 0:
+                raise RuntimeError(
+                    f"设置上报接口失败：{setinf.get('note') or setinf.get('code')}"
+                )
+            _, setcode = ctrl(
+                cmd="setallmsgcode", p1=PUSH_MSG_CODES, p2="on", p3="replace"
+            )
+            if int(setcode.get("code") or 0) != 0:
+                raise RuntimeError(
+                    f"设置消息号失败：{setcode.get('note') or setcode.get('code')}"
+                )
+
+            _, inf = ctrl(cmd="askinf")
+            try:
+                inf_cfg = json.loads(inf.get("val") or "{}")
+            except Exception:
+                inf_cfg = {}
+            inf_url = str(inf_cfg.get("url") or "")
+            if "/webhook?k=" not in inf_url or base.split("//", 1)[-1] not in inf_url:
+                raise RuntimeError("复查失败：上报接口未生效")
+
+            _, codes = ctrl(cmd="askallmsgcode")
+            try:
+                enabled = set(json.loads(codes.get("val") or "{}").get("en") or [])
+            except Exception:
+                enabled = set()
+            missing = [c for c in wanted if c not in enabled]
+            if missing:
+                raise RuntimeError(
+                    "复查失败：缺少消息号 " + ",".join(str(c) for c in missing)
+                )
+
+            item.update(ok=True, method=inf_cfg.get("method"), ctype=inf_cfg.get("ctype"))
+            _audit("push_setup", detail=f"device={device.devId} ip={device.ip}")
+        except HTTPException as exc:
+            item["error"] = str(exc.detail)
+        except Exception as exc:
+            logger.warning("push setup failed for %s: %s", device.ip, exc)
+            item["error"] = str(exc)[:200]
+        items.append(item)
+
+    found = {i["device_id"] for i in items}
+    for missing_id in [i for i in ids if i not in found]:
+        items.append({"device_id": missing_id, "ok": False, "error": "设备不存在"})
+
+    return {
+        "ok": all(i.get("ok") for i in items) and bool(items),
+        "webhook_token_created": token_created,
+        "msg_codes": PUSH_MSG_CODES,
+        "items": items,
+    }
+
 @router.post("/api/sms/send-direct")
 def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):
     if req.slot not in (1, 2):
@@ -393,31 +600,87 @@ def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="设备不存在")
     ip = device.ip
     _ensure_device_ip_allowed_raise(ip)
-    user = (device.user or DEFAULTUSER).strip()
-    pw = (device.passwd or DEFAULTPASS).strip()
+    user, pw = device_credential(device)
+    tid = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    job = SmsJob(
+        tid=tid,
+        device_id=device.id,
+        dev_id=device.devId or "",
+        slot=req.slot,
+        phone=phone,
+        content=content,
+        status="queued",
+        note="等待板子响应",
+        created=int(time.time()),
+        updated=int(time.time()),
+    )
+    db.add(job)
+    db.commit()
     try:
         ok, _ = istargetdevice(ip, user, pw)
         if not ok:
             raise HTTPException(status_code=400, detail="设备认证失败")
+        # Use the documented /ctrl command instead of the legacy /mgr page
+        # endpoint. /mgr answers {"success":true} as soon as its handler runs;
+        # the /ctrl response carries the board's actual queue result.
+        from backend.device_client import ensure_device_token
+        token = ensure_device_token(db, device)
         resp = _get_sync_client().get(
-            f"http://{ip}/mgr",
-            params={"a": "sendsms", "sid": str(req.slot), "phone": phone, "content": content},
-            auth=httpx.DigestAuth(user, pw),
+            f"http://{ip}/ctrl",
+            params={"token": token, "cmd": "sendsms", "p1": str(req.slot),
+                    "p2": phone, "p3": content, "tid": tid},
             timeout=TIMEOUT + 3,
         )
         if resp.status_code == 200:
             try:
                 body = resp.json()
-                if isinstance(body, dict) and body.get("success") is True:
+                if isinstance(body, dict) and body.get("code") == 0:
                     _audit("sms_send", detail=f"device={req.deviceId} slot={req.slot} phone={phone[:4]}***")
-                    return {"ok": True}
-                return {"ok": False, "error": "设备返回发送失败"}
+                    note = str(body.get("note") or "")
+                    job.status = "queued"
+                    job.note = "板子已接收，等待发送结果"
+                    job.updated = int(time.time())
+                    db.commit()
+                    logger.info("sms queued device=%s slot=%s type=%s code=%s note=%s",
+                                req.deviceId, req.slot, body.get("type"), body.get("code"), note[:80])
+                    return {"ok": True, "queued": True, "tid": tid,
+                            "status": "queued", "note": note[:80]}
+                detail = ""
+                if isinstance(body, dict):
+                    detail = str(body.get("note") or body.get("msg") or body.get("error") or "")
+                job.status = "failed"
+                job.note = (detail or "板子拒绝发送")[:255]
+                job.updated = int(time.time())
+                db.commit()
+                logger.warning("sms rejected device=%s slot=%s type=%s code=%s note=%s",
+                               req.deviceId, req.slot, body.get("type") if isinstance(body, dict) else None,
+                               body.get("code") if isinstance(body, dict) else None, detail[:80])
+                return {"ok": False, "tid": tid, "status": "failed",
+                        "error": "设备返回发送失败" + (f"：{detail}" if detail else "")}
             except Exception:
+                job.status = "failed"
+                job.note = "设备返回异常"
+                job.updated = int(time.time())
+                db.commit()
                 return {"ok": False, "error": "设备返回异常"}
+        job.status = "failed"
+        job.note = f"设备通信失败 HTTP {resp.status_code}"
+        job.updated = int(time.time())
+        db.commit()
         return {"ok": False, "error": f"设备通信失败 (HTTP {resp.status_code})"}
-    except HTTPException:
+    except HTTPException as exc:
+        # Auth / ACL refusals never reach the board, so the job must not stay
+        # "queued" forever.
+        job.status = "failed"
+        job.note = str(exc.detail or "设备校验失败")[:255]
+        job.updated = int(time.time())
+        db.commit()
         raise
     except Exception as exc:
+        job.status = "failed"
+        job.note = str(exc)[:255]
+        job.updated = int(time.time())
+        db.commit()
         logger.error("sms send error device=%s: %s", req.deviceId, exc, exc_info=True)
         return {"ok": False, "error": "短信发送失败，请稍后重试"}
 
@@ -587,8 +850,8 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Device not found")
     ip = device.ip
     _ensure_device_ip_allowed_raise(ip)
-    user = (device.user or DEFAULTUSER).strip()
-    pw = (device.passwd or DEFAULTPASS).strip()
+    user, pw = device_credential(device)
+    board_state = "updated"
     try:
         resp = _get_sync_client().post(
             f"http://{ip}/mgr",
@@ -597,17 +860,19 @@ def api_set_sim(devid: int, req: SimReq, db: Session = Depends(get_db)):
             auth=httpx.DigestAuth(user, pw),
             timeout=TIMEOUT + 5,
         )
-        if resp.status_code == 200:
-            device.sim1number = req.sim1
-            device.sim2number = req.sim2
-            db.commit()
-            return {"ok": True}
-        return {"ok": False, "status": resp.status_code}
+        if resp.status_code != 200:
+            board_state = f"http_{resp.status_code}"
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("set sim error device=%s: %s", devid, exc, exc_info=True)
-        return {"ok": False, "error": "SIM配置失败，请稍后重试"}
+        board_state = "unreachable"
+        logger.warning("set sim on board failed device=%s: %s", devid, exc)
+    # The panel needs the number for alerts even when the board is offline or
+    # refuses the write, so persist it locally in every case.
+    device.sim1number = req.sim1.strip()
+    device.sim2number = req.sim2.strip()
+    db.commit()
+    return {"ok": True, "board": board_state}
 
 
 def _enhanced_forward_task_sync(device_info: Dict[str, Any], req: EnhancedBatchForwardReq) -> Dict[str, Any]:

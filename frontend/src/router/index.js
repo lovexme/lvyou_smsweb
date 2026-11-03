@@ -27,6 +27,18 @@ const routes = [
     name: 'Settings',
     component: () => import('../views/SettingsView.vue'),
     meta: { requiresAuth: true }
+  },
+  {
+    path: '/messages',
+    name: 'Messages',
+    component: () => import('../views/MessagesView.vue'),
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/calls',
+    name: 'Calls',
+    component: () => import('../views/CallsView.vue'),
+    meta: { requiresAuth: true }
   }
 ]
 
@@ -41,15 +53,19 @@ export function setAuthStore(store) {
   _authStore = store
 }
 
-router.beforeEach((to, from, next) => {
-  const authed = _authStore
-    ? _authStore.authed
-    : JSON.parse(localStorage.getItem('auth') || '{}').authed
-  if (to.meta.requiresAuth && !authed) {
-    next('/login')
-  } else {
-    next()
+router.beforeEach(async (to, from, next) => {
+  if (!_authStore) {
+    const authed = JSON.parse(localStorage.getItem('auth') || '{}').authed
+    return to.meta.requiresAuth && !authed ? next('/login') : next()
   }
+  // A hard reload starts with an empty in-memory auth flag. Probe the
+  // httpOnly cookie before bouncing the user back to the login page,
+  // otherwise every refresh looks like a lost session.
+  if (to.meta.requiresAuth && !_authStore.authed) {
+    const ok = await _authStore.restore()
+    if (!ok) return next('/login')
+  }
+  next()
 })
 
 export default router

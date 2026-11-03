@@ -18,6 +18,8 @@ import {
   fetchDeviceGroups,
   fetchDevicesPage,
   fetchNumbersPage,
+  moveDevice,
+  setDeviceNote,
   setDeviceAlias,
   setDeviceGroup
 } from '../api/endpoints'
@@ -235,6 +237,35 @@ export const useDevicesStore = defineStore('devices', () => {
     }
   }
 
+  async function move(device, payload) {
+    const notice = useNoticeStore()
+    try {
+      await moveDevice(device.id, payload)
+      await refresh()
+    } catch (e) {
+      notice.set(_detail(e, '排序失败'), 'err')
+    }
+  }
+
+  function moveBy(device, direction) {
+    return move(device, { direction })
+  }
+
+  function moveBefore(device, targetId) {
+    return move(device, { before: targetId })
+  }
+
+  async function saveNote(device, note) {
+    const notice = useNoticeStore()
+    try {
+      await setDeviceNote(device.id, note)
+      notice.set('已保存备注', 'ok')
+      await refresh()
+    } catch (e) {
+      notice.set(_detail(e, '保存备注失败'), 'err')
+    }
+  }
+
   async function deleteOne(device) {
     const notice = useNoticeStore()
     loading.value = true
@@ -297,6 +328,9 @@ export const useDevicesStore = defineStore('devices', () => {
     clearSelection,
     rename,
     regroup,
+    moveBy,
+    moveBefore,
+    saveNote,
     deleteOne,
     batchDeleteSelected,
     displayName

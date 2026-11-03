@@ -32,6 +32,68 @@
       </div>
 
       <div class="settings-card">
+        <h3>设备接入</h3>
+        <div class="cred-form">
+          <label class="cred-row">
+            <span class="setting-label">管理员账号</span>
+            <input v-model="credUser" class="cred-input" placeholder="admin" autocomplete="off" />
+          </label>
+          <label class="cred-row">
+            <span class="setting-label">管理员密码</span>
+            <input
+              v-model="credPass"
+              class="cred-input"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="passwordConfigured ? '已设置，留空表示不修改' : '板子后台的管理员密码'"
+            />
+          </label>
+          <label class="cred-check">
+            <input v-model="applyToAll" type="checkbox" />
+            <span>同时应用到所有已添加设备</span>
+          </label>
+          <div class="cred-actions">
+            <button class="theme-toggle" :disabled="savingCred" @click="saveCred">
+              <span>{{ savingCred ? '保存中…' : '保存' }}</span>
+            </button>
+            <span class="cred-state" :class="{ err: credError }">{{ credStatus }}</span>
+          </div>
+          <p class="cred-hint">
+            扫描新设备、读取状态、批量配置和 OTA 都用这一组凭据；板子改了密码后在这里更新一次即可。
+          </p>
+        </div>
+      </div>
+
+      <div class="settings-card">
+        <h3>消息推送（Bark）</h3>
+        <div class="cred-form">
+          <label class="cred-row">
+            <span class="setting-label">Bark 推送地址</span>
+            <input
+              v-model="barkUrl"
+              class="cred-input"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              :placeholder="barkConfigured ? '已设置（' + barkHost + '），留空表示不修改' : 'https://…/设备Key/分组'"
+            />
+          </label>
+          <div class="cred-actions">
+            <button class="theme-toggle" :disabled="savingBark" @click="saveBark(false)">
+              <span>{{ savingBark ? '保存中…' : '保存' }}</span>
+            </button>
+            <button class="theme-toggle" :disabled="savingBark" @click="saveBark(true)">
+              <span>保存并测试</span>
+            </button>
+            <span class="cred-state" :class="{ err: barkError }">{{ barkStatus }}</span>
+          </div>
+          <p class="cred-hint">
+            收到短信、短信发出/失败/送达时推送到 iPhone。地址含设备 Key，保存后只显示域名，不会再回显完整链接。
+          </p>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>快捷键</h3>
         <div class="shortcuts-list">
           <div class="shortcut-item">
@@ -71,11 +133,17 @@
 </template>
 
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore, useDevicesStore } from '../stores'
 import { useTheme } from '../composables/useTheme'
 import { useDeviceActions } from '../composables/useDeviceActions'
+import {
+  fetchNotifySettings,
+  getDeviceCredentialSetting,
+  saveDeviceCredentialSetting,
+  saveNotifySettings,
+} from '../api/endpoints'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -83,6 +151,122 @@ const devicesStore = useDevicesStore()
 
 const { isDark, toggleTheme } = useTheme()
 const { refresh } = useDeviceActions()
+
+const credUser = ref('admin')
+const credPass = ref('')
+const applyToAll = ref(true)
+const passwordConfigured = ref(false)
+const savingCred = ref(false)
+const credStatus = ref('')
+const credError = ref(false)
+
+const barkUrl = ref('')
+const barkConfigured = ref(false)
+const barkHost = ref('')
+const savingBark = ref(false)
+const barkStatus = ref('')
+const barkError = ref(false)
+
+async function loadNotify() {
+  try {
+    const resp = await fetchNotifySettings()
+    const data = resp.data || {}
+    barkConfigured.value = !!data.bark_configured
+    barkHost.value = data.bark_host || ''
+    barkStatus.value = barkConfigured.value ? '已设置' : '未设置，短信不会推送'
+    barkError.value = !barkConfigured.value
+  } catch (e) {
+    barkStatus.value = '读取失败'
+    barkError.value = true
+  }
+}
+
+async function saveBark(withTest) {
+  if (savingBark.value) return
+  const url = String(barkUrl.value || '').trim()
+  if (!url && barkConfigured.value) {
+    barkStatus.value = '未修改'
+    barkError.value = false
+    return
+  }
+  if (!url) {
+    barkStatus.value = '请填写推送地址'
+    barkError.value = true
+    return
+  }
+  savingBark.value = true
+  barkStatus.value = '保存中…'
+  try {
+    const payload = { bark_url: url }
+    if (withTest) payload.test_bark = true
+    const resp = await saveNotifySettings(payload)
+    const data = resp.data || {}
+    barkUrl.value = ''
+    barkConfigured.value = true
+    let message = '已保存'
+    let failed = false
+    if (withTest) {
+      failed = !data.test_bark_ok
+      message = data.test_bark_ok ? '已保存，推送测试成功' : '已保存，推送测试失败'
+    }
+    await loadNotify()
+    barkError.value = failed
+    barkStatus.value = message
+  } catch (e) {
+    barkError.value = true
+    barkStatus.value = (e.response && e.response.data && e.response.data.detail) || '保存失败'
+  } finally {
+    savingBark.value = false
+  }
+}
+
+async function loadCredential() {
+  try {
+    const resp = await getDeviceCredentialSetting()
+    const data = resp.data || {}
+    credUser.value = data.user || 'admin'
+    passwordConfigured.value = !!data.passwordConfigured
+    credStatus.value = passwordConfigured.value ? '已设置' : '未设置，设备操作会失败'
+    credError.value = !passwordConfigured.value
+  } catch (e) {
+    credStatus.value = '读取失败'
+    credError.value = true
+  }
+}
+
+async function saveCred() {
+  if (savingCred.value) return
+  if (!credPass.value && passwordConfigured.value) {
+    credStatus.value = '未修改密码'
+    credError.value = false
+    return
+  }
+  if (!credPass.value) {
+    credStatus.value = '请输入密码'
+    credError.value = true
+    return
+  }
+  savingCred.value = true
+  credStatus.value = ''
+  try {
+    const resp = await saveDeviceCredentialSetting({
+      user: credUser.value || 'admin',
+      password: credPass.value,
+      applyToAll: applyToAll.value,
+    })
+    const data = resp.data || {}
+    passwordConfigured.value = true
+    credPass.value = ''
+    credError.value = false
+    credStatus.value = data.devicesReset ? `已保存，${data.devicesReset} 台设备改用新凭据` : '已保存'
+    await refresh()
+  } catch (e) {
+    credError.value = true
+    credStatus.value = (e.response && e.response.data && e.response.data.detail) || '保存失败'
+  } finally {
+    savingCred.value = false
+  }
+}
 
 async function handleLogout() {
   await authStore.logout(true)
@@ -92,7 +276,9 @@ async function handleLogout() {
 onMounted(async () => {
   if (!(await authStore.restore())) {
     router.push('/login')
+    return
   }
+  await Promise.all([loadCredential(), loadNotify()])
 })
 </script>
 
@@ -179,4 +365,20 @@ onMounted(async () => {
 .shortcut-desc { font-size: 13px; color: var(--text-secondary); }
 .about-info { display: flex; flex-direction: column; gap: 8px; font-size: 14px; color: var(--text-secondary); }
 .about-info strong { color: var(--text-primary); font-size: 16px; }
+.cred-form { display: flex; flex-direction: column; gap: 14px; }
+.cred-row { display: flex; flex-direction: column; gap: 6px; }
+.cred-input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+.cred-input:focus { outline: none; border-color: var(--primary); }
+.cred-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+.cred-actions { display: flex; align-items: center; gap: 12px; }
+.cred-state { font-size: 13px; color: var(--text-muted); }
+.cred-state.err { color: var(--danger, #e5484d); }
+.cred-hint { font-size: 12px; color: var(--text-muted); line-height: 1.6; }
 </style>
